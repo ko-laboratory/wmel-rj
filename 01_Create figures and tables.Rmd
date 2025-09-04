@@ -1,0 +1,1506 @@
+---
+title: "Figures and tables"
+output: html
+---
+
+```{r setup}
+if (!require("pacman")) install.packages("pacman")
+pacman::p_load(tidyverse, gbmt, mgcv, sf, gtsummary, rlang, ggnewscale, raster, patchwork, terra, ggpubr, exactextractr)
+```
+
+### Load data
+
+```{r}
+# release area shapefile
+release_areas_raw <- read_sf("data/raw/WMP2019_ReleaseAreasRJ.shp")
+
+# trap monitoring
+data_raw <- read_delim("data/raw/monitoring_RJO.csv", delim = ";", locale = locale(encoding = "ISO-8859-1"))
+
+# releases
+releases_raw <- read_csv("data/raw/new-release-data.csv")
+```
+
+### Wrangle and clean datasets
+
+```{r}
+release_areas <- release_areas_raw |> 
+  st_transform(crs = st_crs("+proj=utm +zone=23 +datum=WGS84 +units=m +no_defs")) |> 
+  filter(NOME_DO_MU == "RIO DE JANEIRO") |> 
+  group_by(REGIAO_2) |> 
+  summarise(geometry = st_union(geometry), .groups = "drop") |> 
+  nngeo::st_remove_holes() |> 
+  mutate(REGIAO_2 = if_else(REGIAO_2 == "Maré (RJ3.3)", "RJ3.3", REGIAO_2))
+
+data <- data_raw |> 
+  filter(successful == TRUE & 
+           type == "BG" & 
+           !is.na(target_species_count) & 
+           target_species_count > 0 &
+           !is.na(screening_wmel_aeg)) |> 
+  mutate(week_start = floor_date(collected_at, unit = "week"),
+         year = year(collected_at),
+         intro = screening_wmel_aeg/target_species_count,
+         zone = if_else(str_starts(reporting_area, "RJ3"), substr(reporting_area, 1, 5), substr(reporting_area, 1, 3)),
+         zone = case_when(zone == "RJ3_1" ~ "RJ3.1",
+                          zone == "RJ3_2" ~ "RJ3.2",
+                          zone == "RJ3_3" ~ "RJ3.3",
+                          .default = zone)) |> 
+  filter(zone != "TUB") |> 
+  mutate(study_week = as.numeric(as.Date(week_start) - as.Date("2017-09-24"))/7) |> 
+  group_by(trap_id) |> 
+  mutate(n_trap_events = n(),
+         sum_tested = sum(target_species_count, na.rm = TRUE)) |> 
+  filter(n_trap_events >= 5) |> 
+  ungroup()
+
+releases <- releases_raw |>
+  mutate(area_pre1 = substr(identifier, 1, 3),
+         area_pre2 = substr(identifier, 1, 6),
+         area = case_when(area_pre1 %in% c("RJ1", "RJ2") ~ area_pre1,
+                          area_pre2 %in% c("RJ3.V2", "RJ3.B2") ~ "RJ3.2",
+                          area_pre2 == "RJ3.B3" ~ "RJ3.3",
+                          .default = "RJ3.1")) |>
+  st_as_sf(crs = "EPSG:4326 - WGS 84", coords = c("longitude", "latitude")) |>
+  st_transform(crs = st_crs("+proj=utm +zone=23 +datum=WGS84 +units=m +no_defs")) |>
+  filter(date_of_release < as.Date("2020-04-01"))
+```
+
+### Create 100m grid
+
+```{r}
+conv_ra <- release_areas |>
+  st_transform(crs = 4326)
+
+ra_joined <- release_areas |>
+  st_union()
+
+release_points_clip <- releases |>
+  filter(st_intersects(geometry, ra_joined, sparse = FALSE)[,1])
+
+grid <- st_make_grid(ra_joined, cellsize = 100) |> 
+  st_as_sf() |> 
+  mutate(id = row_number())
+```
+
+### Define color palette
+
+```{r}
+colors <- c("#25489E", "#5482B4", "#EDC21D", "#E4697A", "#CE263D")
+pal <- colorRampPalette(colors)(21)
+pal_hist <- colorRampPalette(colors)(50)
+```
+
+### Create covariate dataset
+
+#### Population
+
+```{r}
+pop <- terra::rast("data/raw/bra_ppp_2018.tif") |>
+  terra::crop(conv_ra, mask = TRUE) |>
+  terra::project(release_areas)
+
+pop$pop_sm <- focal(pop$bra_ppp_2018, w = matrix(1, nc = 3, nr = 3), fun = mean, na.rm = T)
+
+pop_df <- as.data.frame(pop, xy = TRUE) |>
+  mutate(pop = if_else(bra_ppp_2018 < 4, NA, bra_ppp_2018),
+         pop_sm = if_else(pop_sm < 4, NA, pop_sm),
+         pop_km2 = pop_sm*100) |>
+  filter(!is.na(pop))
+```
+
+#### Create grid that matches worldpop raster
+
+```{r}
+pop2 <- terra::rast("data/raw/bra_ppp_2018.tif") |>
+  terra::crop(conv_ra) |>
+  terra::project(release_areas)
+
+pop2$pop_sm <- focal(pop2$bra_ppp_2018, w = matrix(1, nc = 3, nr = 3), fun = mean, na.rm = T)
+
+pop2_df <- as.data.frame(pop2, xy = TRUE) |>
+  mutate(pop = if_else(bra_ppp_2018 < 4, NA, bra_ppp_2018),
+         pop_sm = if_else(pop_sm < 4, NA, pop_sm)) |>
+  st_as_sf(coords = c("x", "y"), crs = crs(release_areas), remove = FALSE)
+
+grid2 <- st_buffer(pop2_df, dist = 50, endCapStyle = "SQUARE") |>
+  mutate(id = row_number())
+```
+
+#### Use grid to count releases and mosquitoes by cell
+
+```{r}
+# count # releases/mosq by point
+rel <- release_points_clip |>
+  group_by(geometry, date_of_release) |>
+  mutate(check = row_number()) |>
+  filter(check == 1) |>
+  group_by(geometry) |>
+  summarise(n = n(),
+            mosq = sum(average_released, na.rm = TRUE))
+
+# count # releases/mosq by 100m cell
+rm <- st_join(grid2, rel, join = st_contains) |>
+  group_by(geometry) |>
+  summarise(id = id[1],
+            releases = sum(n, na.rm = TRUE),
+            mosquitoes = sum(mosq, na.rm = TRUE),
+            pop = mean(pop, na.rm = T),
+            pop_sm = mean(pop_sm, na.rm = T)) |>
+  mutate(geometry = st_centroid(geometry),
+         x = st_coordinates(geometry)[,1],
+         y = st_coordinates(geometry)[,2],
+         mosq2 = mosquitoes,
+         releases = if_else(releases == 0, NA, releases),
+         mosquitoes = if_else(mosquitoes == 0, NA, mosquitoes),
+         mosqpop = mosq2/pop,
+         mosqpop_sm = mosq2/pop_sm) |>
+  filter(st_intersects(geometry, ra_joined, sparse = FALSE)[,1])
+
+# get smooth counts
+pts_agg <- aggregate(rm |> dplyr::select(x, y, mosquitoes),
+                     rm |> dplyr::select(x, y, mosquitoes),
+                     FUN = function(x) mean(x, na.rm = TRUE),
+                     join = function(x, y) st_is_within_distance(x, y, dist = 150))
+
+rm$mosquitoes_sm <- pts_agg$mosquitoes
+
+pts_agg2 <- aggregate(rm |> dplyr::select(x, y, mosqpop),
+                      rm |> dplyr::select(x, y, mosqpop),
+                      FUN = function(x) mean(x, na.rm = TRUE),
+                      join = function(x, y) st_is_within_distance(x, y, dist = 150))
+
+rm$mosqpop_smooth <- pts_agg2$mosqpop
+```
+
+#### Census
+
+```{r}
+# Population
+census_new <- readxl::read_xls("data/raw/sinopse_RJ.xls", na = "X") |>
+  mutate(sector_code = as.character(Cod_setor)) |> 
+  dplyr::select(sector_code, pop = V014)
+
+# Proportion households with water/sewage from general network, garbage collection, electricity
+census_domicilio <- read_delim("data/raw/Domicilio01_RJ.csv", delim = ";", 
+                               col_types = cols(.default = "n", Cod_setor = "c")) |> 
+  mutate(prop_water = V012/V002,
+         prop_sewage = V017/V002,
+         prop_garbage = V035/V002,
+         prop_electric = V043/V002) |> 
+  dplyr::select(sector_code = Cod_setor, prop_water, prop_sewage, prop_garbage, prop_electric) 
+
+# Number of literate people
+census_pessoa <- read_delim("data/raw/Pessoa01_RJ.csv", delim = ";",
+                            col_types = cols(.default = "n", Cod_setor = "c")) |> 
+  dplyr::select(sector_code = Cod_setor, literate_pop = V001)
+
+# Proportion households with public light, paving, sidewalks, greenery, open sewers
+census_entorno <- read_csv("data/raw/Entorno01_RJ.csv",
+                           col_types = cols(.default = "n", Cod_setor = "c")) |> 
+  rowwise() |> 
+  mutate(prop_publiclight = sum(V008, V010, V012, na.rm = TRUE)/V001,
+         prop_paving = sum(V014, V016, V018, na.rm = TRUE)/V001,
+         prop_sidewalks = sum(V020, V022, V024, na.rm = TRUE)/V001,
+         prop_greenery = sum(V044, V046, V048, na.rm = TRUE)/V001,
+         prop_opensewer = sum(V050, V052, V054, na.rm = TRUE)/V001) |>
+  dplyr::select(sector_code = Cod_setor, prop_publiclight, prop_paving, prop_sidewalks, prop_greenery, prop_opensewer)
+
+# Income
+census_pessoarenda <- read_delim("data/raw/PessoaRenda_RJ.csv", delim = ";",
+                           col_types = cols(.default = "n", Cod_setor = "c")) |> 
+  rowwise() |> 
+  mutate(prop_halfminwage = V001/V020,
+         prop_minwage = (V001+V002)/V020,
+         prop_positiveincome = V021/V020,
+         mean_income = V022/V020) |> 
+  dplyr::select(sector_code = Cod_setor, prop_halfminwage, prop_minwage, prop_positiveincome, mean_income)
+
+# Head of household income
+census_resprenda <- read_delim("data/raw/ResponsavelRenda_RJ.csv", delim = ";",
+                           col_types = cols(.default = "n", Cod_setor = "c")) |> 
+  rowwise() |> 
+  mutate(prop_hhhalfminwage = V001/V020,
+         prop_hhminwage = (V001+V002)/V020,
+         prop_hhpositiveincome = V021/V020,
+         hhmean_income = V022/V020) |> 
+  dplyr::select(sector_code = Cod_setor, prop_hhhalfminwage, prop_hhminwage, prop_hhpositiveincome, hhmean_income)
+
+census <- census_new |> 
+  left_join(census_domicilio, by = "sector_code") |> 
+  left_join(census_pessoa, by = "sector_code") |> 
+  left_join(census_entorno, by = "sector_code") |> 
+  left_join(census_pessoarenda, by = "sector_code") |> 
+  left_join(census_resprenda, by = "sector_code") |> 
+  rowwise() |> 
+  mutate(prop_pop_literate = literate_pop / pop,)
+
+census_map <- read_sf("data/raw/rio_setores_censitarios_2010.shp") |> 
+ rename(sector_code = CD_GEOCODI) |> 
+  st_transform(crs = st_crs(ra_joined)) |> 
+  filter(st_intersects(geometry, ra_joined, sparse = FALSE)[,1])
+
+census_sf <- census_map |> 
+  left_join(census, by = "sector_code") |> 
+  mutate(area = st_area(geometry),
+         area_km2 = as.numeric(area)/1000000,
+         popdens = pop / area_km2) |> 
+  st_transform(crs = st_crs("+proj=utm +zone=23 +datum=WGS84 +units=m +no_defs"))
+
+census_intersections <- st_intersection(grid2, census_sf) |>
+  st_drop_geometry() |>
+  group_by(id) |>
+  summarise(mean_income = mean(mean_income, na.rm = TRUE),
+            paving = mean(prop_paving, na.rm = TRUE),
+            lit = mean(prop_pop_literate, na.rm = TRUE),
+            publiclight = mean(prop_publiclight, na.rm = TRUE),
+            sidewalk = mean(prop_sidewalks, na.rm = TRUE),
+            halfminwage = mean(prop_halfminwage, na.rm = TRUE),
+            minwage = mean(prop_minwage, na.rm = TRUE),
+            positiveinc = mean(prop_positiveincome, na.rm = TRUE),
+            hhhalfminwage = mean(prop_hhhalfminwage, na.rm = TRUE),
+            hhminwage = mean(prop_hhminwage, na.rm = TRUE),
+            hhpositiveinc = mean(prop_hhpositiveincome, na.rm = TRUE),
+            hhmean_income = mean(hhmean_income, na.rm = TRUE))
+```
+
+#### Impervious surface
+
+```{r}
+imperv <- terra::rast("data/raw/23K_gmis_impervious_surface_percentage_utm_30m.tif")
+imperv_perc <- terra::classify(imperv, rbind(c(200, NA), c(255, NA)))
+
+imperv_gridded <- exact_extract(imperv_perc, grid2, fun = "sum", append_cols = "id")
+```
+
+#### Urban green space
+
+```{r}
+ugs <- terra::rast("data/raw/BR_151.tif")
+
+ugs_gridded <- exact_extract(ugs, grid2, fun = "sum", append_cols = "id") |>
+  mutate(ugs_m = sum*10) |>
+  dplyr::select(-sum)
+```
+
+#### Elevation
+
+```{r}
+elevation <- terra::rast("data/raw/Rio_elevation.tif")
+elv_grid <- exact_extract(elevation, grid2, fun = "mean", append_cols = "id")
+```
+
+#### Join all
+
+```{r}
+rm_cov <- rm |>
+  left_join(census_intersections, by = "id") |>
+  left_join(imperv_gridded, by = "id") |>
+  mutate(imperv_m2 = sum * 9,
+         imperv_perc = imperv_m2/(100*100)) |>
+  dplyr::select(-sum) |>
+  left_join(ugs_gridded, by = "id") |>
+  mutate(ugs_perc = ugs_m/(100*100)) |>
+  left_join(elv_grid, by = "id") |>
+  rename(elevation = mean)
+```
+
+### Figure 1a inset. Intervention site
+
+```{r}
+rio_state <- read_sf("data/raw/rio_state.shp") |> 
+  st_make_valid()
+
+rio_muni <- rio_state |> 
+  filter(nm_municip == "RIO DE JANEIRO")
+
+rio_box <- st_bbox(rio_muni) |> 
+  st_as_sfc()
+
+ra_box <- st_bbox(conv_ra) |> 
+  st_as_sfc()
+```
+
+```{r, fig.width = 3.3, fig.height = 1.4}
+(fig1a_inset <- ggplot() +
+  geom_sf(data = rio_state, color = NA, fill = "gray50") +
+  geom_sf(data = rio_muni, color = NA, aes(fill = "Rio de Janeiro Municipality")) +
+  geom_sf(data = conv_ra, color = NA, aes(fill = "WMP Release Areas")) +
+  geom_sf(data = ra_box, color = "black", fill = NA, lwd = 0.5) +
+  scale_fill_manual(values = c("Rio de Janeiro Municipality" = "#81A88D",
+                               "WMP Release Areas" = "#9B110E"), 
+                    name = "") +
+  theme_void() +
+  scale_x_continuous(expand = c(0, 0)) +
+  scale_y_continuous(expand = c(0, 0)) +
+  coord_sf(xlim = c(-43.6, -42.9), ylim = c(-23.0, -22.65)) +
+  theme(legend.text = element_text(size = 14),
+        legend.title = element_blank(),
+        legend.position = "none",
+        legend.margin = margin(1, 1, 1, 1, unit = "mm"),
+        panel.border = element_rect(fill = NA, color = "black", size = 0.9),
+        panel.background = element_rect(fill = "white", color = "white")))
+```
+
+### Figure 1a. Population density and study area
+
+```{r}
+galeao_loc <- data.frame(x = -22.8167, y = -43.25) |> 
+  st_as_sf(coords = c("y", "x"), crs = 4326) |> 
+  st_transform(crs = st_crs("+proj=utm +zone=23 +datum=WGS84 +units=m +no_defs"))
+```
+
+```{r, fig.width = 8, fig.height = 6.1}
+rio_state_crop <- st_crop(rio_state |> st_transform(crs = st_crs(release_areas)), st_buffer(st_bbox(release_areas) |> st_as_sfc(), 250))
+
+rio_muni_crop <- st_crop(rio_muni |> st_transform(crs = st_crs(release_areas)),  st_buffer(st_bbox(release_areas) |> st_as_sfc(), 250))
+
+cut_1a <- 300
+
+(fig1a <- rm_cov |> 
+  mutate(pop_sm = if_else(pop_sm > cut_1a, cut_1a, pop_sm),
+         pop_sm = if_else(is.na(pop_sm), 0, pop_sm))|> 
+    ggplot() +
+    geom_sf(data = release_areas, fill = "lightgray", color = NA) +
+    geom_tile(aes(x = x, y = y, fill = pop_sm)) +
+    geom_sf(data = release_areas, fill = NA, color = "black", lwd = 0.9) +
+    geom_sf_label(data = release_areas, aes(label = REGIAO_2), label.size = NA, alpha = 0.6, size = 6, label.padding = unit(0.1, "mm")) +
+    scale_fill_gradientn(colors = pal,
+                         na.value = "transparent",
+                         labels = function(x) {ifelse(x == cut_1a, paste(">", cut_1a), scales::number_format()(x))},
+                         breaks = c(0, 150, 300),
+                         limits = c(0, 300)) +
+    labs(fill = "Population (100m)", title = expression(atop("A. Population density", ""))) +
+    geom_sf(data = galeao_loc, size = 4, shape = 18, color = "white") +
+    geom_sf_text(data = galeao_loc, aes(label = "Galeão\nWeather\nStation"), size = 5, nudge_y = 1200, color = "white", lineheight = 0.8) +
+    ggspatial::annotation_scale(style = "ticks", text_cex = 1.5, line_width = unit(2, "mm"), pad_y = unit(10, "mm"), pad_x = unit(10, "mm")) +
+    scale_x_continuous(expand = c(0, 0)) +
+    scale_y_continuous(expand = expansion(add = c(0, 200))) +
+    theme_void() +
+    coord_sf(xlim = c(671004.4, 690054.6), ylim = c(-2532554.8, -2518908.4)) +
+    theme(panel.background = element_rect(color = "white", fill = "white"),
+          plot.background = element_rect(color = "white", fill = "white"),
+          legend.text = element_text(size = 18),
+          legend.title = element_text(size = 18, vjust = 2),
+          legend.key.size = unit(0.3, "inches"),
+          legend.position = c(0.85, 0.24),
+          legend.background = element_rect(fill = "white", color = "white"),
+          text = element_text(size = 20),
+          panel.spacing = unit(c(0,0,0,0), "pt")))
+```
+
+## Figure 1a + inset
+
+```{r, fig.width = 8, fig.height = 6.1}
+(fig1a_full <- fig1a + inset_element(fig1a_inset, 0, 0.74, 0.38, 1.1))
+```
+
+## Figure 1b. Cumulative released wMel Ae. aegypti per area
+
+```{r, fig.width = 8, fig.height = 6.1}
+cut_1c <- 25000
+  
+(fig1c <- rm_cov |> 
+  mutate(mosquitoes_sm = if_else(mosquitoes_sm > cut_1c, cut_1c, mosquitoes_sm)) |> 
+  ggplot() +
+  geom_sf(data = release_areas, fill = "lightgray", color = NA) +
+  geom_tile(aes(x = x, y = y, fill = mosquitoes_sm)) +
+  geom_sf(data = release_areas, fill = NA, color = "black", lwd = 0.9) +
+  scale_fill_gradientn(colors = pal,
+                       na.value = "transparent",
+                       labels = function(x) {ifelse(x == cut_1c, paste(">", cut_1c), scales::number_format()(x))},
+                       breaks = c(0, 5000, 15000, 25000, 35000)) +
+  labs(fill = expression(paste(italic("w"), "Mel per cell")), 
+       title = expression(paste("B. Released ", italic("w"), "Mel ", italic("Ae. aegypti"), " per 0.01 ", "km"^"2"))) +
+  scale_x_continuous(expand = c(0, 0)) +
+  scale_y_continuous(expand = expansion(add = c(0, 200))) +
+  theme_void() +
+  coord_sf(xlim = c(671004.4, 690054.6), ylim = c(-2532554.8, -2518908.4)) +
+  theme(panel.background = element_rect(color = "white", fill = "white"),
+        plot.background = element_rect(color = "white", fill = "white"),
+        legend.text = element_text(size = 18),
+        legend.title = element_text(size = 18, vjust = 2),
+        legend.key.size = unit(0.3, "inches"),
+        legend.position = c(0.81, 0.24),
+        legend.background = element_rect(fill = "white", color = "white"),
+        text = element_text(size = 20),
+        panel.spacing = unit(c(0,0,0,0), "pt")))
+```
+
+## Figure 1c. Cumulative released wMel Ae. aegypti per inhabitant
+
+```{r, fig.width = 8, fig.height = 6.1}
+cut_1d <- 500
+(fig1d <- rm_cov |> 
+  mutate(mosqpop_smooth = if_else(is.na(pop) & !is.na(mosquitoes_sm), cut_1d, mosqpop_smooth),
+         mosqpop_smooth = if_else(mosqpop_smooth > cut_1d, cut_1d, mosqpop_smooth),
+         mosqpop_smooth = if_else(mosqpop_smooth == 0, NA, mosqpop_smooth)) |> 
+  ggplot() +
+  geom_sf(data = release_areas, aes(fill = "Uninhabited"), color = NA, show.legend = FALSE) +
+  scale_fill_manual(values = c("Uninhabited" = "lightgray"), name = "") +
+  new_scale_fill() +
+  geom_tile(aes(x = x, y = y, fill = mosqpop_smooth)) +
+  scale_fill_gradientn(colors = pal,
+                       na.value = "transparent",
+                       breaks = c(100, 300, 500),
+                       labels = function(x) {ifelse(x == cut_1d, paste(">", cut_1d), scales::number_format()(x))},
+                       name = expression(atop(NA, atop(textstyle(paste(italic("w"), "Mel per cell and")),
+                                                       textstyle(paste("per inhabitant       ")))))) +
+  new_scale_fill() +
+  labs(title = expression(paste("C. Released ", italic("w"), "Mel ", italic("Ae. aegypti"), " per inhabitant"))) +
+  geom_sf(data = release_areas, fill = NA, color = "black", lwd = 0.9) +
+  scale_x_continuous(expand = c(0, 0)) +
+  scale_y_continuous(expand = expansion(add = c(0, 200))) +
+  coord_sf(xlim = c(671004.4, 690054.6), ylim = c(-2532554.8, -2518908.4)) +
+  theme_void() +
+  theme(panel.background = element_rect(color = "white", fill = "white"),
+        plot.background = element_rect(color = "white", fill = "white"),
+        legend.text = element_text(size = 18),
+        legend.title = element_text(size = 18, vjust = 2),
+        legend.key.size = unit(0.3, "inches"),
+        legend.position = c(0.85, 0.2),
+        legend.background = element_rect(fill = "white", color = "white"),
+        text = element_text(size = 20),
+        panel.spacing = unit(c(0,0,0,0), "pt")))
+```
+
+## Figure 1d. Weekly releases of wMel Aedes aegypti
+
+```{r}
+# count # releases/mosq by point and week
+rel <- release_points_clip |>
+  mutate(week_start = floor_date(date_of_release, "week")) |> 
+  group_by(geometry, week_start, area) |>
+  mutate(check = row_number()) |>
+  filter(check == 1) |>
+  summarise(mosq = sum(average_released, na.rm = TRUE))
+
+# count # releases/mosq by 100m cell
+rm <- st_join(rel, grid2, join = st_within)
+
+mosq_cell <- rm |> 
+  st_drop_geometry() |> 
+  group_by(week_start, id, area) |>
+  summarise(mosquitoes = sum(mosq, na.rm = TRUE)) |> 
+  arrange(week_start, mosquitoes)
+```
+
+```{r}
+mosq_cell_person <- mosq_cell |> 
+  left_join(rm_cov |> st_drop_geometry() |> dplyr::select(id, pop) |> distinct(), by = "id") |> 
+  mutate(mosquitoes_person = mosquitoes/pop,
+         mosqpers = if_else(!is.na(mosquitoes) & is.na(pop), 100, mosquitoes_person))
+```
+
+```{r, fig.width = 6, fig.height = 17}
+(fig1b <- mosq_cell |> 
+  mutate(mosquitoes = if_else(mosquitoes > 1000, 1000, mosquitoes)) |> 
+  ggplot() +
+  geom_tile(aes(x = week_start, y = factor(id), fill = mosquitoes)) +
+  facet_grid(area ~., scales = "free_y", switch = "y", space = "free") +
+  scale_fill_gradientn(colors = c("#FFF400", "#E68D1E", "#CE263D"), 
+                       values = c(0, 0.36, 1),
+                       na.value = "transparent",
+                       breaks = c(1, 360, 1000),
+                       labels = c(1, 360, ">1000")) +
+  scale_x_date(labels = scales::date_format("%Y-%m"), date_breaks = "2 months", date_minor_breaks = "months",
+               limits = c(as.Date("2017-08-01"), max(mosq_cell$week_start))) +
+  labs(x = "", y = "Intervention areas", 
+       fill = expression(paste(italic("w"), "Mel per 0.01", "km"^"2", " cell")), 
+       title = expression(paste("D. Weekly released ", italic("w"), "Mel ", italic("Ae. aegypti")))) +
+  theme(panel.grid.major.x = element_line(color = "gray"),
+        panel.grid.minor.x = element_line(color = "lightgray"),
+        axis.text.y = element_blank(),
+        axis.ticks.y = element_blank(),
+        axis.text.x = element_blank(),
+        axis.ticks.x = element_blank(),
+        legend.text = element_text(size = 17),
+        legend.title = element_text(size = 17),
+        text = element_text(size = 20),
+        legend.position = "inside",
+        legend.position.inside = c(0.265, 0.13),
+        legend.box.margin = margin(0, -0.5, -0.5, 0),
+        legend.title.position = "top",
+        legend.key.size = unit(0.3, "inches"),
+        legend.background = element_rect(fill = "white", color = "white"),
+        panel.border = element_rect(fill = NA, color = "black"),
+        strip.background = element_rect(fill = "gray", color = "black"),
+        strip.text.y.left = element_text(angle = 0),
+        legend.direction = "horizontal",
+        axis.text = element_text(size = 16),
+        strip.text = element_text(size = 20),
+        plot.title.position = "plot"))
+```
+
+## Figure 1d plus: temperature
+
+```{r, fig.width = 6, fig.height = 3}
+temp_raw <- read_csv("data/raw/galeao_83746_meteo_new.csv")
+
+temp <- temp_raw |> 
+  filter(date > as.Date("2017-08-27") & date < as.Date("2020-04-01")) |> 
+  mutate(week = floor_date(date, unit = "week")) |> 
+  group_by(week) |> 
+  summarise(tavg = mean(tavg, na.rm = TRUE),
+            tmin = min(tmin, na.rm = TRUE),
+            tmax = max(tmax, na.rm = TRUE)) |> 
+  mutate(temp = "Temperature\n(°C)")
+
+(fig1d2 <- temp |> 
+  ggplot(aes(x = week)) +
+  geom_ribbon(aes(ymin = tmin, ymax = tmax), fill = "#81A88D", alpha = 0.5) +
+  geom_line(aes(y = tavg), lwd = 0.9) +
+  geom_label(aes(x = as.Date("2017-08-15"), y = 15, label = "15", hjust = "right", vjust = "middle"), 
+             size = 6, fill = "white", label.size = NA, label.padding = unit(0, "pt")) +
+  geom_label(aes(x = as.Date("2017-08-15"), y = 25, label = "25", hjust = "right", vjust = "middle"), 
+             size = 6, fill = "white", label.size = NA, label.padding = unit(0, "pt")) +
+  geom_label(aes(x = as.Date("2017-08-15"), y = 35, label = "35", hjust = "right", vjust = "middle"), 
+             size = 6, fill = "white", label.size = NA, label.padding = unit(0, "pt")) +
+  theme_bw() +
+  facet_wrap(temp~., strip.position = "left") +
+  scale_x_date(labels = scales::date_format("%Y-%m"), date_breaks = "2 months",
+               limits = c(as.Date("2017-08-01"), max(mosq_cell$week_start))) +
+  scale_y_continuous(breaks = c(15, 25, 35)) +
+  theme(panel.grid.major.x = element_line(color = "gray"),
+        panel.grid.minor.x = element_blank(),
+        axis.text.x = element_text(angle = 90),
+        axis.text.y = element_blank(),
+        axis.ticks.y = element_blank(),
+        legend.text = element_text(size = 17),
+        legend.title = element_text(size = 17),
+        text = element_text(size = 20),
+        legend.position = "inside",
+        legend.position.inside = c(0.265, 0.13),
+        legend.box.margin = margin(0, -0.5, -0.5, 0),
+        legend.title.position = "top",
+        legend.key.size = unit(0.3, "inches"),
+        legend.background = element_rect(fill = "white", color = "white"),
+        panel.border = element_rect(fill = NA, color = "black"),
+        strip.background = element_rect(fill = "gray", color = "black"),
+        strip.text.y.left = element_text(angle = 90, margin = margin(0, 3.4, 0, 3.4, "mm")), 
+        axis.text = element_text(size = 16),
+        strip.text = element_text(size = 20),
+        axis.title = element_blank(),
+        plot.title = element_blank(),
+        plot.margin = unit(c(0,0,0,0), "mm"),
+        panel.spacing = unit(c(0,0,0,0), "pt")))
+```
+
+## Figure 1
+
+```{r, fig.width = 14.5, fig.height = 18.3}
+design <- "AAAAADDD
+           AAAAADDD
+           BBBBBDDD
+           BBBBBDDD
+           CCCCCDDD
+           CCCCCEEE
+           "
+
+(fig1 <- fig1a_full + fig1c + fig1d + fig1b + fig1d2 + plot_layout(design = design))
+
+# ggsave(plot = fig1, "outputs/fig1_apr24.pdf", width = 14.5, height = 18.3)
+```
+
+## Table S1. Characteristics of areas by quintile of cumulative releases per 100m
+
+```{r}
+trap_grid <- data |> 
+  group_by(trap_id, latitude, longitude) |> 
+  summarise(intro = mean(intro, na.rm = TRUE),
+            aedes = mean(total_aegypti_caught, na.rm = TRUE)) |> 
+  st_as_sf(coords = c("longitude", "latitude"), crs = "EPSG:4326 - WGS 84", remove = FALSE) |> 
+  st_transform(crs = st_crs(grid2))
+  
+trap_grid2 <- st_join(trap_grid, grid2, join = st_within)
+
+trap_grid3 <- trap_grid2 |> 
+  st_drop_geometry() |> 
+  group_by(id) |>
+  summarise(intro = mean(intro, na.rm = TRUE),
+            aedes = mean(aedes, na.rm = TRUE))
+
+rm_cov2 <- rm_cov |> 
+  st_drop_geometry() |> 
+  mutate(mosqarea_cat = cut(mosquitoes, 
+                            breaks = quantile(rm_cov$mosquitoes, c(0, 0.25, 0.5, 0.75, 1), na.rm = TRUE), 
+                            labels = c("1262-6854 mosquitoes/100m", "6855-10428 mosquitoes/100m", "10429-14740 mosquitoes/100m", "14741-70074 mosquitoes/100m"),
+                            include.lowest = TRUE),
+         mosqarea_cat_num = as.numeric(mosqarea_cat),
+         mosqpop_cat = cut(mosqpop, 
+                           breaks =  quantile(rm_cov$mosqpop, c(0, 0.25, 0.5, 0.75, 1), na.rm = TRUE),
+                           labels = c("0-21 mosquitoes/person", "22-79 mosquitoes/person", "79-171 mosquitoes/person", "172-5714 mosquitoes/person"),
+                           include.lowest = TRUE),
+         mosqpop_cat_num = as.numeric(mosqpop_cat)) |> 
+  left_join(trap_grid3, by = "id")
+```
+
+```{r}
+tbl_summary(data = rm_cov2 |> 
+              dplyr::select(mosqarea_cat, intro, aedes, pop, hhmean_income, imperv_perc, ugs_perc, elevation),
+            by = mosqarea_cat,
+            missing = "no",
+            label = list(pop ~ "Inhabitants (100m)",
+                         hhmean_income ~ "Head of household income (R$/month)",
+                         imperv_perc ~ "% impervious surface",
+                         ugs_perc ~ "% green space",
+                         elevation ~ "Elevation")) |> 
+  add_p()
+
+rstatix::cor_test(rm_cov2, vars = "mosqarea_cat_num", vars2 = c("pop", "intro", "aedes", "hhmean_income", "imperv_perc", "ugs_perc", "elevation"), method = "spearman")
+```
+
+```{r}
+tbl_summary(data = rm_cov2 |> 
+              dplyr::select(mosqpop_cat, intro, aedes, pop, hhmean_income, imperv_perc, ugs_perc, elevation),
+            by = mosqpop_cat,
+            #statistic = list(all_continuous() ~ "{mean} ({sd})"),
+            missing = "no",
+            label = list(pop ~ "Inhabitants (100m)",
+                         hhmean_income ~ "Head of household income (R$/month)",
+                         imperv_perc ~ "% impervious surface",
+                         ugs_perc ~ "% green space",
+                         elevation ~ "Elevation")) |> 
+  add_p()
+
+rstatix::cor_test(rm_cov2, vars = "mosqpop_cat_num", vars2 = c("pop", "intro", "aedes", "hhmean_income", "imperv_perc", "ugs_perc", "elevation"), method = "spearman")
+```
+
+## Figure 2a. Map of mean introgression
+
+```{r}
+mintro <- data |> 
+  group_by(latitude,longitude) |> 
+  summarise(meanintro = mean(intro, na.rm = TRUE)) |> 
+  st_as_sf(coords = c("longitude", "latitude"), crs = "EPSG:4326 - WGS 84", remove = FALSE) |> 
+  st_transform(crs = st_crs(grid))
+
+intro_cell <- st_join(mintro, grid, join = st_within)
+
+mean_intro_grid <- intro_cell |> 
+  mutate(x = st_coordinates(geometry)[,1], y = st_coordinates(geometry)[,2]) |> 
+  st_drop_geometry() |> 
+  group_by(id, x, y) |>
+  summarise(intro = mean(meanintro, na.rm = TRUE))
+```
+
+```{r}
+grid4 <- raster(extent(mintro), resolution = c(100,100))
+
+crs(grid4) <- projection(mintro)
+
+grid4$mintro <- rasterize(mintro, grid4, field = "meanintro", fun = mean, na.rm = TRUE)
+
+grid4$mintrosm1 <- focal(grid4$mintro, w = matrix(1, nc = 3, nr = 3), fun = mean, na.rm = TRUE)
+
+grid4$mintrosm <- focal(grid4$mintro, w = matrix(1, nc = 5, nr = 5), fun = mean, na.rm = TRUE)
+  
+grid3 <- mask(grid4, st_zm(conv_ra) |> st_transform(crs = st_crs(mintro)))
+
+grid3db <- as.data.frame(grid3, xy = TRUE)
+```
+
+```{r, fig.width = 9, fig.height = 8}
+(fig2a <- grid3db |> 
+  ggplot() +
+  geom_sf(data = release_areas, fill = "lightgray", color = NA, show.legend = FALSE) +
+  geom_tile(aes(x = x, y = y, fill = mintrosm)) +
+  scale_fill_gradientn(colors = pal, na.value = "transparent", breaks = c(0, 0.5, 1), limits = c(0, 1)) +
+  geom_sf(data = release_areas, fill = NA, color = "black", lwd = 1.2) +
+  theme_void() +
+  labs(title = expression(paste("A. Mean ", italic("w"), "Mel introgression")),
+       fill = expression(paste(italic("w"), "Mel introgression"))) +
+  scale_x_continuous(expand = c(0, 0)) +
+  scale_y_continuous(expand = c(0, 0)) +
+  theme(panel.background = element_rect(color = "white", fill = "white"),
+        plot.background = element_rect(color = "white", fill = "white"),
+        legend.text = element_text(size = 18),
+        legend.title = element_text(size = 18),
+        legend.key.size = unit(0.3, "inches"),
+        legend.position = c(0.85, 0.23),
+        text = element_text(size = 20),
+        plot.title.position = "plot"))
+```
+
+## Figure 2b. Map with clusters
+
+```{r}
+traps_unique <- unique(data$trap_id)
+
+smoothed_data <- data |>
+  mutate(intro_sm = NA)
+
+for (i in 1:length(traps_unique)) {
+  trap <- traps_unique[i]
+
+  sub_data <- data |>
+    filter(trap_id == trap)
+
+  knots <- min(nrow(sub_data) - 1, 6)
+
+  result <- tryCatch({
+    mod <- gam(intro ~ s(study_week, bs = "cr", k = knots),
+               data = sub_data,
+               weights = target_species_count,
+               family = binomial(link = "logit"),
+               method = "REML")
+
+    sub_data |>
+      mutate(intro_sm = predict(mod, type = "response")) |>
+      dplyr::select(trap_id, study_week, intro_sm)
+  }, warning = function(w) {
+    sub_data |>
+      mutate(intro_sm = NA) |>
+      dplyr::select(trap_id, study_week, intro_sm)
+  })
+
+  smoothed_data <- smoothed_data |>
+    left_join(result, by = c("trap_id", "study_week")) |>
+    mutate(intro_sm = coalesce(intro_sm.x, intro_sm.y)) |>
+    dplyr::select(-intro_sm.x, -intro_sm.y)
+}
+
+smoothed_nas <- smoothed_data |> 
+  filter(is.na(intro_sm))
+
+smoothed_nonas <- smoothed_data |> 
+  filter(!is.na(intro_sm)) |> 
+  mutate(intro_sm = as.numeric(round(intro_sm, 2))) |> 
+  ungroup() |> 
+  dplyr::select(trap_id, intro_sm, study_week, total_aegypti_caught, week_start) |> 
+  group_by(trap_id) |> 
+  mutate(intro_sm_mean = mean(intro_sm, na.rm = TRUE),
+         aegypti_mean = mean(total_aegypti_caught, na.rm = TRUE)) |> 
+  ungroup() |> 
+  mutate(intro_sc = if_else(intro_sm_mean == 0, 0, intro_sm/intro_sm_mean)) |> 
+  filter(week_start < as.Date("2020-04-01") & trap_id != "RJ3.B3.BG0028_1")
+```
+
+```{r}
+cluster4_sm <- gbmt(x.names = "intro_sm", unit = "trap_id", time = "study_week", ng = 4, d = 10,
+                    data = as.data.frame(smoothed_nonas), scaling = 0, nstart = 10)
+
+cluster4_sm_db <- tibble(trap_id = names(cluster4_sm$assign),
+                         cluster = cluster4_sm$assign, logl = cluster4_sm$posterior)
+```
+
+```{r}
+radius = 400 # meters
+
+trap_circles <- data |>
+  distinct(longitude, latitude, trap_id) |>
+  st_as_sf(coords = c("longitude", "latitude"), crs = "EPSG:4326 - WGS 84", remove = FALSE) |>
+  st_transform(crs = st_crs("+proj=utm +zone=23 +datum=WGS84 +units=m +no_defs"))
+
+trap_circles_unique <- st_as_sf(st_buffer(trap_circles$geometry, dist = radius)) |>
+  mutate(trap_id = trap_circles$trap_id)
+
+releases_pre <- releases_raw |>
+  mutate(week_start = floor_date(date_of_release, "week")) |>
+  filter(week_start < as.Date("2020-12-31")) |>
+  group_by(longitude, latitude) |>
+  summarise(mosq_released = sum(average_released, na.rm = TRUE)) |>
+  st_as_sf(coords = c("longitude", "latitude"), crs = "EPSG:4326 - WGS 84", remove = FALSE) |>
+  st_transform(crs = st_crs("+proj=utm +zone=23 +datum=WGS84 +units=m +no_defs"))
+
+releases <- st_join(trap_circles_unique, releases_pre, join = st_contains)
+
+releases2 <- releases |>
+  st_drop_geometry() |>
+  group_by(trap_id) |>
+  summarise(mosq_released = sum(mosq_released, na.rm = TRUE))
+
+pop_circles <- exact_extract(pop$bra_ppp_2018, trap_circles_unique, fun = "sum", append_cols = "trap_id", progress = FALSE) |>
+  rename(pop_sum = sum)
+
+elv_circles <- exact_extract(elevation, trap_circles_unique, fun = "mean", append_cols = "trap_id", progress = FALSE) |>
+  rename(elev = mean)
+
+ugs_circles <- exact_extract(ugs, trap_circles_unique, fun = "sum", append_cols = "trap_id", progress = FALSE) |>
+  mutate(ugs_m = sum*10,
+         ugs_perc = ugs_m/(pi*radius^2)*100) |>
+  dplyr::select(-sum)
+
+imperv_circles <- exact_extract(imperv_perc, trap_circles_unique, fun = "mean", append_cols = "trap_id", progress = FALSE) |>
+  rename(imperv_perc = mean)
+
+census2 <- st_join(trap_circles_unique, census_sf, join = st_intersects)
+
+census3 <- census2 |>
+  st_drop_geometry() |>
+  group_by(trap_id) |>
+  summarise(prop_minwage = mean(prop_minwage, na.rm = TRUE),
+            mean_income = mean(mean_income, na.rm = TRUE),
+            prop_hhminwage = mean(prop_hhminwage, na.rm = TRUE),
+            hhmean_income = mean(hhmean_income, na.rm = TRUE))
+
+covariates <- data |>
+  dplyr::select(trap_id) |>
+  distinct() |>
+  left_join(releases2, by = "trap_id") |>
+  left_join(pop_circles, by = "trap_id") |>
+  left_join(elv_circles, by = "trap_id") |>
+  left_join(ugs_circles, by = "trap_id") |>
+  left_join(imperv_circles, by = "trap_id") |>
+  left_join(census3, by = "trap_id")
+```
+
+```{r, fig.width = 9, fig.height = 8}
+fig2b_db <- cluster4_sm_db |> 
+  left_join(data |> dplyr::select(trap_id, latitude, longitude) |> unique(), by = "trap_id") |> 
+  st_as_sf(coords = c("longitude", "latitude"), crs = "EPSG:4326 - WGS 84", remove = FALSE) |> 
+  filter(st_contains(release_areas |> 
+                          st_transform(crs = "EPSG:4326 - WGS 84") |> 
+                          summarise(geometry = st_union(geometry)),
+                        geometry, sparse = FALSE)[1,]) |> 
+  mutate(cluster2 = factor(case_when(cluster == 2 ~ "Cluster 1",
+                              cluster == 3 ~ "Cluster 2",
+                              cluster == 1 ~ "Cluster 3",
+                              cluster == 4 ~ "Cluster 4"),
+                           levels = c("Cluster 1", "Cluster 2", "Cluster 3", "Cluster 4")))
+
+
+(fig2b <- fig2b_db |> 
+  ggplot() +
+  geom_sf(data = release_areas, fill = "lightgray", color = NA, alpha = 0.5) +
+  geom_sf(aes(color = cluster2), size = 2) +
+  scale_color_manual(values = c("#CE263D", "#E68061", "#ECB826", "#25489E")) +
+  geom_sf(data = release_areas, fill = NA, color = "black", lwd = 1.2) +
+  labs(color = "",
+       title = "B. Trap distribution by cluster assignment") +
+  scale_x_continuous(expand = c(0, 0)) +
+  scale_y_continuous(expand = c(0, 0)) +
+  theme_void() +
+  theme(panel.background = element_rect(color = "white", fill = "white"),
+        plot.background = element_rect(color = "white", fill = "white"),
+        legend.text = element_text(size = 18),
+        legend.title = element_text(size = 18),
+        legend.key.size = unit(0.3, "inches"),
+        legend.position = c(0.85, 0.2),
+        text = element_text(size = 20),
+        plot.title.position = "plot"))
+```
+
+## Figure 2c. Cluster trajectories
+
+```{r}
+sw <- smoothed_nonas |> 
+  dplyr::select(study_week, week_start) |> 
+  distinct()
+```
+
+```{r}
+fit4 <- data.frame(study_week = as.numeric(rownames(cluster4_sm$fitted[[4]])), fit = cluster4_sm$fitted[[4]]) |> 
+  left_join(sw, by = "study_week")
+
+fig2c4 <- smoothed_nonas |> 
+  left_join(cluster4_sm_db, by = "trap_id") |> 
+  filter(cluster == 4) |> 
+  ggplot() +
+  geom_line(aes(x = week_start, y = intro_sm, group = trap_id), alpha = 0.3) +
+  geom_line(data = fit4, aes(x = week_start, y = intro_sm), color = "red", lwd = 2) +
+  theme_bw() +
+  labs(x = "", y = "Introgression", title = "Cluster 4") +
+  coord_cartesian(ylim = c(0,1)) +
+  theme(text = element_text(size = 20),
+        plot.title = element_text(margin = margin(10,0,0,0)),
+        axis.text.x = element_text(angle = 90))
+```
+
+```{r}
+fit1 <- data.frame(study_week = as.numeric(rownames(cluster4_sm$fitted[[1]])), fit = cluster4_sm$fitted[[1]]) |> 
+  left_join(sw, by = "study_week")
+
+fig2c3 <- smoothed_nonas |> 
+      left_join(cluster4_sm_db, by = "trap_id") |> 
+      filter(cluster == 1) |> 
+      ggplot() +
+      geom_line(aes(x = week_start, y = intro_sm, group = trap_id), alpha = 0.3) +
+      geom_line(data = fit1, aes(x = week_start, y = intro_sm), color = "red", lwd = 2) +
+      theme_bw() +
+      labs(x = "", y = "Introgression", title = "Cluster 3") +
+      coord_cartesian(ylim = c(0,1)) +
+  theme(text = element_text(size = 20),
+        plot.title = element_text(margin = margin(10,0,0,0)),
+        axis.text.x = element_text(angle = 90))
+```
+
+```{r}
+fit3 <- data.frame(study_week = as.numeric(rownames(cluster4_sm$fitted[[3]])), fit = cluster4_sm$fitted[[3]]) |> 
+  left_join(sw, by = "study_week")
+
+fig2c2 <- smoothed_nonas |> 
+      left_join(cluster4_sm_db, by = "trap_id") |> 
+      filter(cluster == 3) |> 
+      ggplot() +
+      geom_line(aes(x = week_start, y = intro_sm, group = trap_id), alpha = 0.3) +
+      geom_line(data = fit3, aes(x = week_start, y = intro_sm), color = "red" , lwd = 2) +
+      theme_bw() +
+      labs(x = "", y = "Introgression", title = "Cluster 2") +
+      coord_cartesian(ylim = c(0,1)) +
+  theme(text = element_text(size = 20),
+        plot.title = element_text(margin = margin(10,0,0,0)),
+        axis.text.x = element_text(angle = 90))
+```
+
+```{r}
+fit2 <- data.frame(study_week = as.numeric(rownames(cluster4_sm$fitted[[2]])), fit = cluster4_sm$fitted[[2]]) |> 
+  left_join(sw, by = "study_week")
+
+fig2c1 <- smoothed_nonas |> 
+      left_join(cluster4_sm_db, by = "trap_id") |> 
+      filter(cluster == 2) |> 
+      ggplot() +
+      geom_line(aes(x = week_start, y = intro_sm, group = trap_id), alpha = 0.3) +
+      geom_line(data = fit2, aes(x = week_start, y = intro_sm), color = "red", lwd = 2) +
+      theme_bw() +
+      labs(x = "", y = "Introgression", title = "Cluster 1") +
+      coord_cartesian(ylim = c(0,1)) +
+  theme(text = element_text(size = 20),
+        plot.title = element_text(margin = margin(10,0,0,0)),
+        axis.text.x = element_text(angle = 90))
+```
+
+### Figure 2
+
+```{r}
+layout <- "
+AAAAAAAABBBBBBBB
+AAAAAAAABBBBBBBB
+AAAAAAAABBBBBBBB
+AAAAAAAABBBBBBBB
+CCCCDDDDEEEEFFFF
+CCCCDDDDEEEEFFFF"
+```
+
+```{r, fig.width = 18, fig.height = 10}
+(fig2 <- 
+  fig2a + fig2b + fig2c1 + fig2c2 + fig2c3 + fig2c4 +
+  plot_annotation(tag_levels = list(c("", "", "C", "", "", "")), ) +
+  plot_layout(design = layout) &
+  guides(color = guide_legend(override.aes = list(size = 6))) &
+  theme(plot.tag.position = c(0.04, 1)))
+
+# ggsave(plot = fig2, "outputs/fig2_sep19.pdf", width = 18, height = 10)
+# ggsave(plot = fig2, "outputs/fig2_sep19.png", width = 18, height = 10)
+```
+
+### Characterize clusters
+
+```{r}
+charac <- covariates |> 
+  left_join(cluster4_sm_db |> dplyr::select(cluster, trap_id), by = "trap_id") |> 
+  left_join(smoothed_nonas |> dplyr::select(trap_id, aegypti_mean, intro_sm_mean), by = "trap_id") |> 
+  distinct() |> 
+  left_join(data |> dplyr::select(trap_id, zone) |> distinct(), by = "trap_id") |> 
+  mutate(cluster4 = case_when(cluster == 2 ~ 1,
+                              cluster == 3 ~ 2,
+                              cluster == 1 ~ 3,
+                              cluster == 4 ~ 4))
+```
+
+```{r}
+tbl_summary(
+  data = charac |> 
+    dplyr::select(cluster4, mosq_released, intro_sm_mean, aegypti_mean, pop_sum, ugs_perc, imperv_perc, elev, hhmean_income, mean_income, zone) |> 
+    mutate(mosqpers = mosq_released/pop_sum), 
+  by = "cluster4", 
+  missing = "no"
+            ) |> 
+  add_p()
+```
+
+```{r}
+rstatix::cor_test(charac, vars = "cluster4", vars2 = c("mosq_released", "intro_sm_mean", "aegypti_mean", "pop_sum", "ugs_perc", "imperv_perc", "elev", "hhmean_income", "mean_income"), method = "spearman")
+```
+
+```{r}
+releases_raw2 <- releases_raw |>
+  mutate(week_start_rel = floor_date(date_of_release, "week")) |>
+  filter(week_start_rel < as.Date("2020-04-01")) |>
+  group_by(longitude, latitude, week_start_rel, date_of_release) |>
+  summarise(mosq_released = sum(average_released, na.rm = TRUE)) |>
+  st_as_sf(coords = c("longitude", "latitude"), crs = "EPSG:4326 - WGS 84", remove = FALSE) |>
+  st_transform(crs = st_crs("+proj=utm +zone=23 +datum=WGS84 +units=m +no_defs"))
+
+releases2 <- st_join(trap_circles_unique, releases_raw2, join = st_contains)
+
+releases3 <- releases2 |>
+  st_drop_geometry() |>
+  mutate(week_lag = week_start_rel + 7) |> 
+  group_by(trap_id, week_start_rel, week_lag, date_of_release) |>
+  summarise(mosq_released = sum(mosq_released, na.rm = TRUE))
+
+relareaperson <- releases3 |> 
+  ungroup() |> 
+  left_join(cluster4_sm_db |> dplyr::select(cluster, trap_id), by = "trap_id") |> 
+  left_join(covariates |> dplyr::select(-mosq_released), by = "trap_id") |> 
+  mutate(mosqperson = if_else(pop_sum > 0, mosq_released/pop_sum, mosq_released/(pop_sum+1)),
+         cluster4 = case_when(cluster == 2 ~ 1,
+                              cluster == 3 ~ 2,
+                              cluster == 1 ~ 3,
+                              cluster == 4 ~ 4))
+
+tbl_summary(
+  data = relareaperson |> dplyr::select(cluster4, mosq_released, mosqperson),
+  by = "cluster4",
+  missing = "no"
+)
+
+rstatix::cor_test(relareaperson, vars = "cluster4", vars2 = c("mosq_released", "mosqperson"))
+```
+
+## Table S4: Characterize clusters, other radii
+
+#### 50m
+
+```{r}
+covariates_50 <- read_rds("data/interim/covariates-50m.rds")
+
+charac_50 <- covariates_50 |> 
+  left_join(cluster4_sm_db |> dplyr::select(cluster, trap_id), by = "trap_id") |> 
+  left_join(smoothed_nonas |> dplyr::select(trap_id, aegypti_mean, intro_sm_mean), by = "trap_id") |> 
+  distinct() |> 
+  left_join(data |> dplyr::select(trap_id, zone) |> distinct(), by = "trap_id") |> 
+  mutate(cluster4 = case_when(cluster == 2 ~ 1,
+                              cluster == 3 ~ 2,
+                              cluster == 1 ~ 3,
+                              cluster == 4 ~ 4))
+```
+
+```{r}
+tbl_summary(
+  data = charac_50 |> dplyr::select(cluster4, mosq_released, intro_sm_mean, aegypti_mean, pop_sum, ugs_perc, imperv_perc, elev, hhmean_income, mean_income, zone), 
+  by = "cluster4", 
+  missing = "no"
+            ) |> 
+  add_p()
+```
+
+```{r}
+rstatix::cor_test(charac_50, vars = "cluster4", vars2 = c("mosq_released", "intro_sm_mean", "aegypti_mean", "pop_sum", "ugs_perc", "imperv_perc", "elev", "hhmean_income", "mean_income"), method = "spearman")$var2
+
+round(rstatix::cor_test(charac_50, vars = "cluster4", vars2 = c("mosq_released", "intro_sm_mean", "aegypti_mean", "pop_sum", "ugs_perc", "imperv_perc", "elev", "hhmean_income", "mean_income"), method = "spearman")$p, 3)
+```
+
+#### 150m
+
+```{r}
+covariates_150 <- read_rds("data/interim/covariates-150m.rds")
+
+charac_150 <- covariates_150 |> 
+  left_join(cluster4_sm_db |> dplyr::select(cluster, trap_id), by = "trap_id") |> 
+  left_join(smoothed_nonas |> dplyr::select(trap_id, aegypti_mean, intro_sm_mean), by = "trap_id") |> 
+  distinct() |> 
+  left_join(data |> dplyr::select(trap_id, zone) |> distinct(), by = "trap_id") |> 
+  mutate(cluster4 = case_when(cluster == 2 ~ 1,
+                              cluster == 3 ~ 2,
+                              cluster == 1 ~ 3,
+                              cluster == 4 ~ 4))
+```
+
+```{r}
+tbl_summary(
+  data = charac_150 |> dplyr::select(cluster4, mosq_released, intro_sm_mean, aegypti_mean, pop_sum, ugs_perc, imperv_perc, elev, hhmean_income, mean_income, zone), 
+  by = "cluster4", 
+  missing = "no"
+            ) |> 
+  add_p()
+```
+
+```{r}
+rstatix::cor_test(charac_150, vars = "cluster4", vars2 = c("mosq_released", "intro_sm_mean", "aegypti_mean", "pop_sum", "ugs_perc", "imperv_perc", "elev", "hhmean_income", "mean_income"), method = "spearman")$var2
+
+round(rstatix::cor_test(charac_150, vars = "cluster4", vars2 = c("mosq_released", "intro_sm_mean", "aegypti_mean", "pop_sum", "ugs_perc", "imperv_perc", "elev", "hhmean_income", "mean_income"), method = "spearman")$p, 3)
+```
+
+#### 200m
+
+```{r}
+covariates_200 <- read_rds("data/interim/covariates-200m.rds")
+
+charac_200 <- covariates_200 |> 
+  left_join(cluster4_sm_db |> dplyr::select(cluster, trap_id), by = "trap_id") |> 
+  left_join(smoothed_nonas |> dplyr::select(trap_id, aegypti_mean, intro_sm_mean), by = "trap_id") |> 
+  distinct() |> 
+  left_join(data |> dplyr::select(trap_id, zone) |> distinct(), by = "trap_id") |> 
+  mutate(cluster4 = case_when(cluster == 2 ~ 1,
+                              cluster == 3 ~ 2,
+                              cluster == 1 ~ 3,
+                              cluster == 4 ~ 4))
+```
+
+```{r}
+tbl_summary(
+  data = charac_200 |> dplyr::select(cluster4, mosq_released, intro_sm_mean, aegypti_mean, pop_sum, ugs_perc, imperv_perc, elev, hhmean_income, mean_income, zone), 
+  by = "cluster4", 
+  missing = "no"
+            ) |> 
+  add_p()
+```
+
+```{r}
+rstatix::cor_test(charac_200, vars = "cluster4", vars2 = c("mosq_released", "intro_sm_mean", "aegypti_mean", "pop_sum", "ugs_perc", "imperv_perc", "elev", "hhmean_income", "mean_income"), method = "spearman")$var2
+
+round(rstatix::cor_test(charac_200, vars = "cluster4", vars2 = c("mosq_released", "intro_sm_mean", "aegypti_mean", "pop_sum", "ugs_perc", "imperv_perc", "elev", "hhmean_income", "mean_income"), method = "spearman")$p, 3)
+```
+
+#### 300m
+
+```{r}
+covariates_300 <- read_rds("data/interim/covariates-300m.rds")
+
+charac_300 <- covariates_300 |> 
+  left_join(cluster4_sm_db |> dplyr::select(cluster, trap_id), by = "trap_id") |> 
+  left_join(smoothed_nonas |> dplyr::select(trap_id, aegypti_mean, intro_sm_mean), by = "trap_id") |> 
+  distinct() |> 
+  left_join(data |> dplyr::select(trap_id, zone) |> distinct(), by = "trap_id") |> 
+  mutate(cluster4 = case_when(cluster == 2 ~ 1,
+                              cluster == 3 ~ 2,
+                              cluster == 1 ~ 3,
+                              cluster == 4 ~ 4))
+```
+
+```{r}
+tbl_summary(
+  data = charac_300 |> dplyr::select(cluster4, mosq_released, intro_sm_mean, aegypti_mean, pop_sum, ugs_perc, imperv_perc, elev, hhmean_income, mean_income, zone), 
+  by = "cluster4", 
+  missing = "no"
+            ) |> 
+  add_p()
+```
+
+```{r}
+rstatix::cor_test(charac_300, vars = "cluster4", vars2 = c("mosq_released", "intro_sm_mean", "aegypti_mean", "pop_sum", "ugs_perc", "imperv_perc", "elev", "hhmean_income", "mean_income"), method = "spearman")$var2
+
+round(rstatix::cor_test(charac_300, vars = "cluster4", vars2 = c("mosq_released", "intro_sm_mean", "aegypti_mean", "pop_sum", "ugs_perc", "imperv_perc", "elev", "hhmean_income", "mean_income"), method = "spearman")$p, 3)
+```
+
+#### 400 m
+
+```{r}
+covariates_400 <- read_rds("data/interim/covariates-400m.rds")
+
+charac_400 <- covariates_400 |> 
+  left_join(cluster4_sm_db |> dplyr::select(cluster, trap_id), by = "trap_id") |> 
+  left_join(smoothed_nonas |> dplyr::select(trap_id, aegypti_mean, intro_sm_mean), by = "trap_id") |> 
+  distinct() |> 
+  left_join(data |> dplyr::select(trap_id, zone) |> distinct(), by = "trap_id") |> 
+  mutate(cluster4 = case_when(cluster == 2 ~ 1,
+                              cluster == 3 ~ 2,
+                              cluster == 1 ~ 3,
+                              cluster == 4 ~ 4))
+```
+
+```{r}
+tbl_summary(
+  data = charac_400 |> dplyr::select(cluster4, mosq_released, intro_sm_mean, aegypti_mean, pop_sum, ugs_perc, imperv_perc, elev, hhmean_income, mean_income, zone), 
+  by = "cluster4", 
+  missing = "no"
+            ) |> 
+  add_p()
+```
+
+```{r}
+rstatix::cor_test(charac_400, vars = "cluster4", vars2 = c("mosq_released", "intro_sm_mean", "aegypti_mean", "pop_sum", "ugs_perc", "imperv_perc", "elev", "hhmean_income", "mean_income"), method = "spearman")$var2
+
+round(rstatix::cor_test(charac_400, vars = "cluster4", vars2 = c("mosq_released", "intro_sm_mean", "aegypti_mean", "pop_sum", "ugs_perc", "imperv_perc", "elev", "hhmean_income", "mean_income"), method = "spearman")$p, 3)
+```
+
+## Get wildtype abundance estimates for first week
+
+```{r}
+radius = 100 # meters
+
+trap_circles <- data_raw |>
+  filter(successful == TRUE & 
+           type == "BG" & 
+           !is.na(target_species_count) & 
+           target_species_count > 0 &
+           !is.na(screening_wmel_aeg)) |> 
+    mutate(week_start = floor_date(collected_at, unit = "week"),
+         year = year(collected_at),
+         intro = screening_wmel_aeg/target_species_count,
+         zone = if_else(str_starts(reporting_area, "RJ3"), substr(reporting_area, 1, 5), substr(reporting_area, 1, 3)),
+         zone = case_when(zone == "RJ3_1" ~ "RJ3.1",
+                          zone == "RJ3_2" ~ "RJ3.2",
+                          zone == "RJ3_3" ~ "RJ3.3",
+                          .default = zone)) |> 
+  filter(zone != "TUB") |> 
+  distinct(longitude, latitude, trap_id) |>
+  st_as_sf(coords = c("longitude", "latitude"), crs = "EPSG:4326 - WGS 84", remove = FALSE) |>
+  st_transform(crs = st_crs("+proj=utm +zone=23 +datum=WGS84 +units=m +no_defs"))
+
+trap_circles_unique <- st_as_sf(st_buffer(trap_circles$geometry, dist = radius)) |>
+  mutate(trap_id = trap_circles$trap_id)
+
+releases2 <- st_join(trap_circles_unique, releases_raw2, join = st_contains)
+
+releases3 <- releases2 |>
+  st_drop_geometry() |>
+  mutate(week_lag = week_start_rel + 7) |> 
+  group_by(trap_id, week_start_rel, week_lag, date_of_release) |>
+  summarise(mosq_released = sum(mosq_released, na.rm = TRUE))
+```
+
+(using probability of daily survival - 0.82, as estimated in Tubiacanga https://journals.plos.org/plosone/article?id=10.1371/journal.pone.0160196)
+
+```{r}
+pds <- 0.82
+
+# Filtering to only first week of trapping
+trapping_firstweek <- data_raw |> 
+  filter(successful == TRUE & 
+           type == "BG" & 
+           !is.na(target_species_count) & 
+           target_species_count > 0 &
+           !is.na(screening_wmel_aeg)) |> 
+  mutate(week_start = floor_date(collected_at, unit = "week"),
+         year = year(collected_at),
+         intro = screening_wmel_aeg/target_species_count,
+         zone = if_else(str_starts(reporting_area, "RJ3"), substr(reporting_area, 1, 5), substr(reporting_area, 1, 3)),
+         zone = case_when(zone == "RJ3_1" ~ "RJ3.1",
+                          zone == "RJ3_2" ~ "RJ3.2",
+                          zone == "RJ3_3" ~ "RJ3.3",
+                          .default = zone)) |> 
+  filter(zone != "TUB") |> 
+  mutate(study_week = as.numeric(as.Date(week_start) - as.Date("2017-09-24"))/7,
+         wmel_extrap = screening_wmel_aeg/target_species_count*total_aegypti_caught) |> 
+  arrange(week_start) |> 
+  group_by(trap_id) |> 
+  mutate(numb_trap_event = row_number(),
+         days_to_collect = as.Date(collected_at) - as.Date(set_date)) |> 
+  filter(numb_trap_event %in% c(1)) 
+
+# Joining all releases to traps
+trapping_rel_firstweek <- releases3 |> 
+  left_join(trapping_firstweek, by = c("trap_id")) |> 
+  filter(!is.na(mosq_released)) |> 
+  mutate(days_since_release = as.Date(collected_at) - date_of_release) |> 
+  filter(days_since_release > 0) |> 
+  group_by(trap_id) |> 
+  mutate(max_days = as.numeric(max(days_since_release))) |> 
+  ungroup()
+```
+
+### Stratify by quantile, calculate FF index
+
+```{r}
+trap_meanintro <- data |> 
+  group_by(trap_id) |> 
+  summarise(meanintro_w = weighted.mean(intro, total_aegypti_caught),
+            meanintro = mean(intro))
+  
+ff_by_quantile <- trapping_rel_firstweek |> 
+  mutate(quant = cut(max_days, breaks = quantile(check$days_since_release), include.lowest = TRUE, labels = c("9 - 36 days (85/234 traps)",
+                                                                                                              "37 - 56 days (147/225 traps)",
+                                                                                                              "57 - 267 days (143/246 traps)",
+                                                                                                              "268 - 857 days (130/213 traps)")),
+         coeff = mosq_released*(pds^as.numeric(days_since_release))) |> 
+  ungroup() |> 
+  arrange(date_of_release) |> 
+  group_by(trap_id) |> 
+  summarise(coeff_prod = sum(coeff),
+            total_aegypti_caught = total_aegypti_caught[1],
+            wmel_extrap = wmel_extrap[1],
+            quant = quant[1],
+            firstrel = mosq_released[1],
+            meanrel = mean(mosq_released),
+            max_days = max_days[1],
+            days_to_collect = days_to_collect[1]) |> 
+  mutate(ff = if_else(wmel_extrap != 0, coeff_prod*total_aegypti_caught/wmel_extrap, NA),
+         rel_ff_ratio = firstrel/ff,
+         rel_ff_ratio2 = meanrel/ff) |> 
+  left_join(trap_meanintro, by = "trap_id") |> 
+  left_join(smoothed_nonas |> dplyr::select(trap_id, intro_sm_mean) |> distinct(), by = "trap_id") |> 
+  left_join(cluster4_sm_db, by = "trap_id") |> 
+  mutate(cluster2 = factor(case_when(cluster == 2 ~ 1,
+                              cluster == 3 ~ 2,
+                              cluster == 1 ~ 3,
+                              cluster == 4 ~ 4),
+                           levels = c(1, 2, 3, 4),
+                           labels = c("Cluster 1", "Cluster 2", "Cluster 3", "Cluster 4")))
+```
+
+## Figure 5 Fisher-Ford
+
+```{r, fig.width = 7, fig.height = 5}
+lm_5c3 <- summary(lm(meanintro ~ ff, data = ff_by_quantile |> filter(quant == "9 - 36 days (85/234 traps)")))
+lm_5d3 <- summary(lm(meanintro ~ log(rel_ff_ratio2), data = ff_by_quantile |> filter(quant == "9 - 36 days (85/234 traps)")))
+
+(figure_5c3 <- ff_by_quantile |> 
+  filter(quant == "9 - 36 days (85/234 traps)") |> 
+  ggplot(aes(x = ff, y = meanintro)) +
+  geom_point() +
+  geom_smooth(method = "lm") +
+  theme_bw() +
+  labs(y = expression(paste(italic("w"), "Mel introgression")), x = "FF Index") +
+  theme(text = element_text(size = 20)) +
+  annotate("text", x = Inf, y = 0.8, color = "#3366FF", hjust = 1.05, size = 6,
+           label = paste0("y = ", round(lm_5c3$coefficients[1], 3), " - ", abs(round(lm_5c3$coefficients[2]*10000, 3)), "x / 10 000")) +
+  annotate("text", x = Inf, y = 0.7, color = "#3366FF", hjust = 1.1, size = 6, 
+           label = paste("p =", round(lm_5c3$coefficients[8], 3))) +
+  annotate("text", x = Inf, y = 0.6, color = "#3366FF", hjust = 1.1, size = 6,
+           label = paste0("R² = ", round(lm_5c3$r.squared, 3))))
+
+(figure_5d3 <- ff_by_quantile |> 
+  filter(quant == "9 - 36 days (85/234 traps)") |> 
+  ggplot(aes(y = meanintro, x = log(rel_ff_ratio2))) +
+  geom_point() +
+  geom_smooth(method = "lm") +
+  theme_bw() +
+  scale_x_continuous(breaks = c(log(0.1), log(0.3), log(1), log(3), log(10)), labels = c(0.1, 0.3, 1, 3, 10)) +
+  labs(y = expression(paste(italic("w"), "Mel introgression")), x = expression(over(paste(italic("w"), "Mel released"), "FF Index"))) +
+  theme(text = element_text(size = 20)) +
+  annotate("text", x = Inf, y = 0.8, color = "#3366FF", hjust = 1.05, size = 6,
+           label = paste0("y = ", round(lm_5d3$coefficients[1], 3), " + ", round(lm_5d3$coefficients[2], 3), " log(x)")) +
+  annotate("text", x = Inf, y = 0.7, color = "#3366FF", hjust = 1.1, size = 6, 
+           label = paste("p =", round(lm_5d3$coefficients[8], 3))) +
+  annotate("text", x = Inf, y = 0.6, color = "#3366FF", hjust = 1.1, size = 6,
+           label = paste0("R² = ", round(lm_5d3$r.squared, 3))))
+```
+
+```{r, fig.width = 14, fig.height = 5, warning = FALSE}
+(fig52 <- (figure_5c3 | figure_5d3) + plot_annotation(tag_levels = "A"))
+
+# ggsave(plot = fig52, "outputs/fig5v2_sep26.pdf", width = 14, height = 5)
+# ggsave(plot = fig52, "outputs/fig5v2_sep26.png", width = 14, height = 5, device = "png")
+```
+
+### Figure S20: ROC curve
+
+```{r, fig.height = 5, fig.width = 5}
+p_load("plotROC")
+
+roc_db <- ff_by_quantile |> 
+  filter(quant == "9 - 36 days (85/234 traps)" & !is.na(rel_ff_ratio2)) |> 
+  mutate(intro_20 = if_else(meanintro >= 0.2, 1, 0))
+```
+
+```{r, fig.height = 6, fig.width = 6}
+(roc_plot20 <- roc_db |> 
+  ggplot(aes(d = intro_20, m = rel_ff_ratio2)) +
+  geom_roc() +
+  geom_roc(color = "#3366FF", labels = FALSE) +
+  geom_abline(slope = 1, intercept = 0, lty = 2) +
+  labs(title = "ROC for wMel released/FF to predict 20% introgression", x = "1 - Specificity", y = "Sensitivity") +
+  theme_bw())
+
+auc_value20 <- calc_auc(roc_plot20)$AUC
+```
+
+### Figure S21: Fisher-Ford 100m cells
+
+```{r}
+pop2_df <- as.data.frame(pop2, xy = TRUE) |>
+  st_as_sf(coords = c("x", "y"), crs = crs(release_areas), remove = FALSE)
+
+grid_new <- st_buffer(pop2_df, dist = 50, endCapStyle = "SQUARE") |>
+  mutate(id = row_number())
+
+intro_cell2 <- st_join(mintro, grid_new, join = st_within)
+
+intro_cell3 <- intro_cell2 |> 
+  mutate(x = st_coordinates(geometry)[,1], y = st_coordinates(geometry)[,2]) |> 
+  st_drop_geometry() |> 
+  group_by(id) |>
+  summarise(intro = mean(meanintro, na.rm = TRUE))
+```
+
+```{r}
+trap_cell <- st_join(grid_new, 
+                     trapping_firstweek |> 
+                       st_as_sf(coords = c("longitude", "latitude"), crs = "EPSG:4326 - WGS 84", remove = FALSE) |>
+                       st_transform(crs = st_crs("+proj=utm +zone=23 +datum=WGS84 +units=m +no_defs")), 
+                     join = st_contains)
+
+trap_cell2 <- trap_cell |> 
+  st_drop_geometry() |> 
+  filter(!is.na(week_start)) |> 
+  group_by(id) |> 
+  summarise(sum_wmel = sum(wmel_extrap, na.rm = TRUE),
+            sum_aed = sum(total_aegypti_caught, na.rm = TRUE),
+            collected_at = min(collected_at),
+            n_coll = length(collected_at)) |> 
+  filter(n_coll == 1) |> 
+  dplyr::select(-n_coll) |> 
+  ungroup()
+  
+releases_cell <- st_join(grid_new, releases_raw2, join = st_contains)
+
+releases_cell2 <- releases_cell |>
+  st_drop_geometry() |>
+  filter(!is.na(week_start_rel)) |> 
+  mutate(week_lag = week_start_rel + 7) |> 
+  group_by(id, week_start_rel, week_lag, date_of_release) |>
+  summarise(mosq_released = sum(mosq_released, na.rm = TRUE)) |> 
+  ungroup()
+
+traprel_cell <- releases_cell2 |> 
+  left_join(trap_cell2, by = "id") |> 
+  filter(!is.na(mosq_released)) |> 
+  mutate(days_since_release = as.Date(collected_at) - date_of_release) |> 
+  filter(days_since_release > 0) |> 
+  group_by(id) |> 
+  mutate(max_days = as.numeric(max(days_since_release))) |> 
+  ungroup() |> 
+  filter(max_days <= 36) |> 
+  mutate(coeff = mosq_released*(pds^as.numeric(days_since_release))) |> 
+  arrange(date_of_release) |> 
+  group_by(id) |> 
+  summarise(coeff_sum = sum(coeff),
+            total_aegypti_caught = sum_aed[1],
+            wmel_extrap = sum_wmel[1],
+            firstrel = mosq_released[1],
+            meanrel = mean(mosq_released),
+            max_days = max_days[1]) |> 
+  mutate(ff = if_else(wmel_extrap != 0, coeff_sum*total_aegypti_caught/wmel_extrap, NA),
+         rel_ff_ratio = firstrel/ff,
+         rel_ff_ratio2 = meanrel/ff) |> 
+  left_join(intro_cell3, by = "id")
+```
+
+```{r, fig.width = 7, fig.height = 5}
+lm_cell1 <- summary(lm(intro ~ ff, data = traprel_cell))
+lm_cell2 <- summary(lm(intro ~ log(rel_ff_ratio2), data = traprel_cell))
+
+coeff1 <- round(lm_cell1$coefficients[2]*10000, 3)
+
+(fig5a_100m <- traprel_cell |> 
+  ggplot(aes(x = ff, y = intro)) +
+  geom_point() +
+  geom_smooth(method = "lm") +
+  theme_bw() +
+  labs(y = expression(paste(italic("w"), "Mel introgression")), x = "FF Index") +
+  theme(text = element_text(size = 20)) +
+  annotate("text", x = Inf, y = 0.8, color = "#3366FF", hjust = 1.05, size = 6,
+           label = expression(paste("Slope = -0.034 × ", "10"^"-4"))) +
+  annotate("text", x = Inf, y = 0.7, color = "#3366FF", hjust = 1.1, size = 6, 
+           label = paste("p =", round(lm_cell1$coefficients[8], 3))) +
+  annotate("text", x = Inf, y = 0.6, color = "#3366FF", hjust = 1.1, size = 6,
+           label = paste0("R² = ", round(lm_cell1$r.squared, 3))) +
+  coord_cartesian(ylim = c(0, 0.8)))
+
+(fig5b_100m <-traprel_cell |> 
+  ggplot(aes(y = intro, x = log(rel_ff_ratio2))) +
+  geom_point() +
+  geom_smooth(method = "lm") +
+  theme_bw() +
+  scale_x_continuous(breaks = c(log(0.01), log(0.03), log(0.1), log(0.3), log(1), log(3), log(10)), labels = c(0.01, 0.03, 0.1, 0.3, 1, 3, 10)) +
+  labs(y = expression(paste(italic("w"), "Mel introgression")), x = expression(over(paste(italic("w"), "Mel released"), "FF Index"))) +
+  theme(text = element_text(size = 20)) +
+  annotate("text", x = Inf, y = 0.8, color = "#3366FF", hjust = 1.05, size = 6,
+           label = paste0("Slope = ", round(lm_cell2$coefficients[2], 3))) +
+  annotate("text", x = Inf, y = 0.7, color = "#3366FF", hjust = 1.1, size = 6, 
+           label = "p = 0.000") +
+  annotate("text", x = Inf, y = 0.6, color = "#3366FF", hjust = 1.1, size = 6,
+           label = paste0("R² = ", round(lm_cell2$r.squared, 3))) +
+  coord_cartesian(ylim = c(0, 0.8)))
+```
+
+```{r, fig.width = 14, fig.height = 5, warning = FALSE}
+(fig5_100m <- (fig5a_100m | fig5b_100m) + plot_annotation(tag_levels = "A"))
+
+# ggsave(plot = fig5_100m, "outputs/fig5100m_oct7.pdf", width = 14, height = 5)
+# ggsave(plot = fig5_100m, "outputs/fig5100m_oct7.png", width = 14, height = 5, device = "png")
+```
