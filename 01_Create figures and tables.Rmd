@@ -1367,6 +1367,106 @@ lm_5d3 <- summary(lm(meanintro ~ log(rel_ff_ratio2), data = ff_by_quantile |> fi
 # ggsave(plot = fig52, "outputs/fig5v2_sep26.png", width = 14, height = 5, device = "png")
 ```
 
+```{r}
+check <- trapping_rel_firstweek |>
+  arrange(week_start_rel) |>
+  group_by(trap_id) |>
+  mutate(nrel = row_number()) |>
+  filter(nrel == 1) |>
+  ungroup()
+
+compute_ff <- function(phi) {
+  trapping_rel_firstweek |>
+    filter(max_days < 36) |>
+    mutate(coeff = mosq_released * (phi ^ as.numeric(days_since_release))) |>
+    arrange(date_of_release) |>
+    group_by(trap_id) |>
+    summarise(
+      coeff_prod          = sum(coeff),
+      total_aegypti_caught = total_aegypti_caught[1],
+      wmel_extrap         = wmel_extrap[1],
+      meanrel             = mean(mosq_released),
+      max_days            = max_days[1]
+    ) |>
+    mutate(
+      phi         = phi,
+      ff          = if_else(wmel_extrap != 0,
+                            coeff_prod * total_aegypti_caught / wmel_extrap,
+                            NA_real_),
+      rel_ff_ratio = meanrel / ff
+    ) |>
+    left_join(trap_meanintro, by = "trap_id") |>
+    filter(!is.na(ff), !is.na(meanintro))
+}
+```
+
+```{r}
+phi_values <- seq(0.75, 0.90, by = 0.01)
+
+phi_results <- map_dfr(phi_values, function(phi) {
+  df <- compute_ff(phi)
+
+  lm_a <- lm(meanintro ~ ff,               data = df)
+  lm_b <- lm(meanintro ~ log(rel_ff_ratio), data = df)
+
+  sa <- summary(lm_a)
+  sb <- summary(lm_b)
+
+  tibble(
+    phi             = phi,
+    n               = nrow(df),
+    # FF index ~ introgression
+    ff_slope        = coef(lm_a)[["ff"]],
+    ff_p            = sa$coefficients["ff", "Pr(>|t|)"],
+    ff_r2           = sa$r.squared,
+    # log(release/FF) ~ introgression
+    ratio_slope     = coef(lm_b)[["log(rel_ff_ratio)"]],
+    ratio_p         = sb$coefficients["log(rel_ff_ratio)", "Pr(>|t|)"],
+    ratio_r2        = sb$r.squared
+  )
+})
+
+print(phi_results, n = Inf)
+```
+
+```{r}
+phi_long <- phi_results |>
+  pivot_longer(
+    cols      = c(ff_slope, ff_r2, ratio_slope, ratio_r2),
+    names_to  = c("model", "metric"),
+    names_sep = "_",
+    values_to = "value"
+  ) |>
+  mutate(
+    model  = recode(model, ff = "FF Index ~ introgression",
+                    ratio = "log(wMel released / FF) ~ introgression"),
+    metric = recode(metric, slope = "Slope", r2 = "R²")
+  )
+
+phi_sensitivity_plot <- phi_long |>
+  ggplot(aes(x = phi, y = value, color = model)) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2) +
+  geom_vline(xintercept = 0.82, linetype = "dashed", color = "gray40") +
+  facet_wrap(model~ metric, scales = "free_y") +
+  scale_color_manual(values = c("FF Index ~ introgression"          = "#3366FF",
+                                "log(wMel released / FF) ~ introgression" = "#CE263D")) +
+  labs(
+    x     = expression(phi ~ "(daily survival probability)"),
+    y     = NULL,
+    color = NULL
+    # title = "Sensitivity of FF-index associations to daily survival probability",
+    # caption = "Dashed line = phi used in paper (0.82). n = 85 traps in all runs."
+  ) +
+  theme_bw() +
+  theme(legend.position = "bottom", text = element_text(size = 13))
+
+phi_sensitivity_plot
+
+# ggsave("outputs/figureS14_phi_sensitivity.pdf", plot = phi_sensitivity_plot, width = 10, height = 5)
+ggsave("outputs/figures14_phi_sensitivity.png", plot = phi_sensitivity_plot, width = 10, height = 5)
+```
+
 ### Figure S20: ROC curve
 
 ```{r, fig.height = 5, fig.width = 5}
