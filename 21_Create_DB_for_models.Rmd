@@ -1,0 +1,2070 @@
+---
+title: "21_Create_DB_for_models"
+author: "Elisabeth Nelson"
+date: "2024-07-19"
+output: pdf_document
+---
+
+## Packages 
+```{r setup, include=FALSE, warning=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(gridExtra)
+library(patchwork)
+library(viridis)
+library(readxl)
+library(sf)
+library(gridExtra)
+library(RColorBrewer)
+library(stats)
+library(lubridate)
+pacman::p_load(terra, exactextractr)
+library(INLA)
+
+```
+
+## Data
+```{r - data import}
+new_trapping_data <- read_delim("~/Documents/Yale EMD/Year 2/Rio Data Analysis/Data/monitoring_RJO.csv", 
+                                  delim = ";", escape_double = FALSE, trim_ws = TRUE, 
+                                  locale = locale(encoding = "ISO-8859-1"))
+new_release_data <- read_csv("~/Documents/Yale EMD/Year 2/Rio Data Analysis/Data/bq-results-20240525-203815-1716669740340.csv")
+covariate_gbmt <- readRDS("covariates-gbmt.rds")
+#pop <- terra::rast("~/Documents/Yale EMD/Year 2/Rio Data Analysis/Data/covariate raw files/bra_ppp_2018.tif")
+elevation <- terra::rast("~/Documents/Yale EMD/Year 2/Rio Data Analysis/Data/covariate raw files/Rio_elevation.tif")
+ugs <- terra::rast("~/Documents/Yale EMD/Year 2/Rio Data Analysis/Data/covariate raw files/BR_151.tif")
+imperv <- terra::rast("~/Documents/Yale EMD/Year 2/Rio Data Analysis/Data/covariate raw files/23K_gmis_impervious_surface_percentage_utm_30m.tif")
+lst <- rast("~/Documents/Yale EMD/Year 2/Rio Data Analysis/Data/covariate raw files/Rio_LSTemp.tif")
+census <- read_rds("~/Documents/Yale EMD/Year 2/Rio Data Analysis/Data/covariate raw files/census_sf.rds") |> 
+   st_transform(crs = st_crs("+proj=utm +zone=23 +datum=WGS84 +units=m +no_defs")) |> 
+   dplyr::select(prop_minwage, mean_income, prop_hhminwage, hhmean_income)
+
+meteo_week_2 <- readRDS("data/meteo_data_through_2020.rds")
+#spatial_mod_full_data_scaled <- readRDS("data/spatial_mod_full_data_scaled.rds")
+
+mrr_abun <- read_rds("db-mrr2.rds")
+
+```
+
+## Clean Trap Level Data 
+```{r - trap-level data cleaning}
+trapping_data_2 <- new_trapping_data %>%
+  filter(type == "BG") %>%
+  filter(successful == TRUE) %>%
+  filter(collected_at <= "2020-03-31") %>%
+  filter(screening_total_aeg > 0) %>%
+  mutate(area = substr(trap_id, 1, 3)) %>%
+  filter(area != "TUB") %>%
+  mutate(collected_at = as.Date(collected_at, format = "%Y/%m/%d"),
+         total_aegypti_caught = as.numeric(total_aegypti_caught), 
+         screening_total_aeg = as.numeric(screening_total_aeg), 
+         screening_wmel_aeg = as.numeric(screening_wmel_aeg), 
+         trap_wmel_prev = screening_wmel_aeg/screening_total_aeg, 
+         extrap_wmel = floor(trap_wmel_prev*total_aegypti_caught), 
+         week = week(collected_at), 
+         year = year(collected_at), 
+         week.date = floor_date(collected_at, unit = 'week')) %>%
+  ungroup() %>%
+  group_by(trap_id, week.date) %>%
+  mutate(trapping_events = n()) %>%
+  summarize(tot_aegypti = sum(total_aegypti_caught, na.rm = T), 
+            tot_aeg_screened = sum(screening_total_aeg, na.rm = T), 
+            tot_wmel_screened = sum(screening_wmel_aeg, na.rm = T), 
+            trap_avg_wmel_prev = mean(trap_wmel_prev, na.rm = T), 
+            trap_events = mean(trapping_events, na.rm = T), 
+            tot_wmel = sum(extrap_wmel, na.rm = T), 
+            reporting_area, 
+            latitude, 
+            longitude) %>%
+  mutate(norm_tot_aegypti = tot_aegypti/trap_events) %>%
+  ungroup() %>%
+    mutate(year = year(week.date), 
+           week = week(week.date)) %>%
+  distinct(trap_id, week.date, .keep_all = T)
+
+
+weekly_trapping_data_sf <- st_as_sf(trapping_data_2, coords = c("longitude", "latitude"), crs = 4326) %>%
+  st_transform(crs = st_crs("+proj=utm +zone=23 +datum=WGS84 +units=m +no_defs")) 
+
+#saveRDS(weekly_trapping_data_sf, "data/new_weekly_trapping_data_sf.rds")  
+
+```
+
+## Get Mosquitoes Released in the 100m Area
+```{r - release join}
+trapping_data_geom <- weekly_trapping_data_sf %>%
+  dplyr::select(trap_id, geometry) %>%
+  distinct(trap_id, .keep_all = T)
+
+## Create Circles
+# circles with radius 100m
+circles <- st_buffer(trapping_data_geom, dist = 100)
+circles_sf <- st_as_sf(circles)
+
+## get distinct release points
+new_release_data_2 <- st_as_sf(new_release_data, coords = c("longitude", "latitude"), crs = 4326) %>%
+  st_transform(crs = st_crs("+proj=utm +zone=23 +datum=WGS84 +units=m +no_defs")) %>%
+  filter(date_of_release <= "2020-03-31")
+
+# side data frame to get each release location 
+release_data_2 <- new_release_data_2 %>%
+  filter(type_of_release == "Adult") #%>%
+ # dplyr::select(identifier, longitude, latitude) %>%
+  #distinct(identifier, .keep_all = T)
+
+new_release_data_3 <- st_as_sf(release_data_2, coords = c("longitude", "latitude"), crs = 4326) %>%
+  st_transform(crs = st_crs("+proj=utm +zone=23 +datum=WGS84 +units=m +no_defs"))
+
+## check to make sure release points and circles overlap
+ggplot()+
+  geom_sf(data = circles_sf$geometry)+
+  geom_sf(data = new_release_data_3$geometry)+
+  theme_bw()
+  
+## Combine releases with trap circles
+# count # release points in each circle
+rp <- st_join(circles_sf, release_data_2, join = st_contains) 
+rp_2 <- as.data.frame(rp) %>%
+  dplyr::select(-(geometry)) %>%
+  dplyr::select(-(type_of_release)) %>%
+  mutate(week.date = floor_date(date_of_release, unit = 'week')) %>%
+  group_by(week.date, trap_id) %>%
+  summarize(mozzies_rel = sum(average_released, na.rm = T), 
+            n_release_points = n()) %>%
+  group_by(trap_id) %>%
+  arrange(week.date) %>%
+  mutate(mozzies_rel = if_else(is.na(mozzies_rel), 0, mozzies_rel), 
+         mozzies_rel_plus1 = mozzies_rel+1,
+         mozzies_rel_lag1 = lag(mozzies_rel, 1), 
+         mozzies_rel_lag1 = if_else(is.na(mozzies_rel_lag1), 0, mozzies_rel_lag1),
+         mozzies_rel_plus1_lag1 = lag(mozzies_rel_plus1, 1),
+         mozzies_rel_lag2 = lag(mozzies_rel, 2),
+         mozzies_rel_lag2 = if_else(is.na(mozzies_rel_lag2), 0, mozzies_rel_lag2),
+         mozzies_rel_plus1_lag2 = lag(mozzies_rel_plus1, 2),
+         mozzies_rel_lag3 = lag(mozzies_rel, 3), 
+         mozzies_rel_lag3 = if_else(is.na(mozzies_rel_lag3), 0, mozzies_rel_lag3),
+         mozzies_rel_plus1_lag3 = lag(mozzies_rel_plus1, 3),
+         mozzies_rel_lag4 = lag(mozzies_rel, 4), 
+         mozzies_rel_lag4 = if_else(is.na(mozzies_rel_lag4), 0, mozzies_rel_lag4),
+         mozzies_rel_plus1_lag4 = lag(mozzies_rel_plus1, 4),
+         mozzies_rel_lag5 = lag(mozzies_rel, 5), 
+         mozzies_rel_lag5 = if_else(is.na(mozzies_rel_lag5), 0, mozzies_rel_lag5),
+         mozzies_rel_plus1_lag5 = lag(mozzies_rel_plus1, 5),
+         mozzies_rel_lag6 = lag(mozzies_rel, 6), 
+         mozzies_rel_lag6 = if_else(is.na(mozzies_rel_lag6), 0, mozzies_rel_lag6),
+         mozzies_rel_plus1_lag6 = lag(mozzies_rel_plus1, 6),
+         mozzies_rel_lag7 = lag(mozzies_rel, 7), 
+         mozzies_rel_lag7 = if_else(is.na(mozzies_rel_lag7), 0, mozzies_rel_lag7),
+         mozzies_rel_plus1_lag7 = lag(mozzies_rel_plus1, 7),
+         mozzies_rel_lag8 = lag(mozzies_rel, 8), 
+         mozzies_rel_lag8 = if_else(is.na(mozzies_rel_lag8), 0, mozzies_rel_lag8), 
+         mozzies_rel_plus1_lag8 = lag(mozzies_rel_plus1, 8)) %>%
+  ungroup() 
+
+## get first release date
+rel_first <- rp_2 %>%
+  filter(mozzies_rel > 0) %>%
+  group_by(trap_id) %>%
+  mutate(n = row_number(), 
+         first_rel_date = if_else(n == 1, week.date, NA), 
+         full_first_rel_date = mean(first_rel_date, na.rm = T),
+         t_since_first_rel = difftime(week.date, full_first_rel_date, units = "weeks"), 
+         t_since_first_rel = as.numeric(t_since_first_rel)) %>%
+  ungroup() %>%
+  dplyr::select(week.date, trap_id, t_since_first_rel) 
+
+rp_3 <- left_join(rp_2, rel_first, by = c("trap_id" = "trap_id", "week.date" = "week.date"))
+
+## combine trapping and release data
+trapping_data_t2 <- full_join(weekly_trapping_data_sf, rp_3,
+                                      by = c("trap_id" = "trap_id", 
+                                             "week.date" = "week.date"))
+
+## filter out releases without trapping
+trapping_data_t3 <- trapping_data_t2 %>%
+  filter(!is.na(tot_aegypti)) %>%
+  mutate(tot_wmel = if_else(tot_aegypti == 0, 0, tot_wmel)) %>%
+    mutate(release_zone = if_else(grepl('RJ1', trap_id), "RJ1", "NA"), 
+         release_zone = if_else(grepl('RJ2', trap_id), "RJ2", release_zone), 
+         release_zone = if_else(grepl('RJ3.B1', trap_id) | 
+                                  grepl('RJ3.V1', trap_id), "RJ3.1", release_zone),
+         release_zone = if_else(grepl('RJ3.B2', trap_id) | 
+                                  grepl('RJ3.V2', trap_id), "RJ3.2", release_zone),
+         release_zone = if_else(grepl('RJ3.B3', trap_id) | 
+                                  grepl('RJ3.V3', trap_id), "RJ3.3", release_zone), 
+         release_zone = as.factor(release_zone))
+
+
+#saveRDS(trapping_data_t3, "data/new_trapping_data_t3.rds")
+
+
+```
+
+## Trap Level Model Set-Up
+```{r - model set-up}
+trap_model_df <- trapping_data_t3 %>%
+  mutate(trap_id = as.factor(trap_id), 
+         release_zone = as.factor(release_zone)) %>%
+  ungroup() %>%
+  arrange(week.date) %>%
+  group_by(trap_id) %>%
+  mutate(wmel_prev_lag1 = lag(trap_avg_wmel_prev, 1), 
+         wmel_prev_lag2 = lag(trap_avg_wmel_prev, 2), 
+         wmel_prev_lag3 = lag(trap_avg_wmel_prev, 3), 
+         wmel_prev_lag4 = lag(trap_avg_wmel_prev, 4),
+         wmel_prev_lag5 = lag(trap_avg_wmel_prev, 5),
+         wmel_prev_lag6 = lag(trap_avg_wmel_prev, 6),
+         wmel_prev_lag7 = lag(trap_avg_wmel_prev, 7),
+         wmel_prev_lag8 = lag(trap_avg_wmel_prev, 8), 
+         log_mozzies_rel = log(mozzies_rel), 
+         log_mozzies_rel = if_else(log_mozzies_rel == -Inf, 0, log_mozzies_rel), 
+         log_mozzies_rel_lag1 = log(mozzies_rel_lag1), 
+         log_mozzies_rel_lag1 = if_else(log_mozzies_rel_lag1 == -Inf, 0, log_mozzies_rel_lag1), 
+         log_mozzies_rel_lag2 = log(mozzies_rel_lag2), 
+         log_mozzies_rel_lag2 = if_else(log_mozzies_rel_lag2 == -Inf, 0, log_mozzies_rel_lag2),
+         log_mozzies_rel_lag3 = log(mozzies_rel_lag3), 
+         log_mozzies_rel_lag3 = if_else(log_mozzies_rel_lag3 == -Inf, 0, log_mozzies_rel_lag3), 
+         log_mozzies_rel_lag4 = log(mozzies_rel_lag4), 
+         log_mozzies_rel_lag4 = if_else(log_mozzies_rel_lag4 == -Inf, 0, log_mozzies_rel_lag4), 
+         log_mozzies_rel_lag5 = log(mozzies_rel_lag5), 
+         log_mozzies_rel_lag5 = if_else(log_mozzies_rel_lag5 == -Inf, 0, log_mozzies_rel_lag5), 
+         log_mozzies_rel_lag6 = log(mozzies_rel_lag6), 
+         log_mozzies_rel_lag6 = if_else(log_mozzies_rel_lag6 == -Inf, 0, log_mozzies_rel_lag6), 
+         log_mozzies_rel_lag7 = log(mozzies_rel_lag7), 
+         log_mozzies_rel_lag7 = if_else(log_mozzies_rel_lag7 == -Inf, 0, log_mozzies_rel_lag7), 
+         log_mozzies_rel_lag8 = log(mozzies_rel_lag8), 
+         log_mozzies_rel_lag8 = if_else(log_mozzies_rel_lag8 == -Inf, 0, log_mozzies_rel_lag8), 
+         log_tot_aegypti = log(tot_aegypti), 
+         log_tot_aegypti = if_else(log_tot_aegypti == -Inf, 0, log_tot_aegypti), 
+         log_tot_aegypti_lag1 = lag(log_tot_aegypti, 1),
+         log_tot_aegypti_lag2 = lag(log_tot_aegypti, 2),
+         log_tot_aegypti_lag3 = lag(log_tot_aegypti, 3),
+         log_tot_aegypti_lag4 = lag(log_tot_aegypti, 4),
+         log_tot_aegypti_lag5 = lag(log_tot_aegypti, 5),
+         log_tot_aegypti_lag6 = lag(log_tot_aegypti, 6),
+         log_tot_aegypti_lag7 = lag(log_tot_aegypti, 7),
+         log_tot_aegypti_lag8 = lag(log_tot_aegypti, 8)) %>%
+  ungroup() 
+
+#saveRDS(trap_model_df, "data/trap_model_df.rds")
+
+```
+
+
+## Set Up Covariates 
+#### Population
+
+```{r}
+pop <- covariate_gbmt %>%
+  dplyr::select(trap_id, pop_sum)
+# pop_circles <- exact_extract(pop, circles_sf, fun = "sum", append_cols = "trap_id", progress = FALSE) |> 
+#   rename(pop_sum = sum)
+```
+
+#### Elevation
+
+```{r}
+ elv_circles <- exact_extract(elevation, circles_sf, fun = "mean", append_cols = "trap_id", progress = FALSE) |> 
+   rename(elev = mean)
+```
+
+#### Urban green space
+
+```{r}
+ ugs_circles <- exact_extract(ugs, circles_sf, fun = "sum", append_cols = "trap_id", progress = FALSE) |>
+   mutate(ugs_m = sum*10,
+          ugs_perc = ugs_m/(pi*100^2)*100) |>
+   dplyr::select(-sum)
+```
+
+#### Impervious surface
+
+```{r}
+ imperv_perc <- terra::classify(imperv, rbind(c(200, NA), c(255, NA)))
+# 
+ imperv_circles <- exact_extract(imperv_perc, circles_sf, fun = "mean", append_cols = "trap_id", progress = FALSE) |> 
+   rename(imperv_perc = mean)
+```
+
+#### Land surface temperature
+
+```{r}
+ lst_circles <- exact_extract(lst, circles_sf, fun = "mean", append_cols = "trap_id", progress = FALSE) |> 
+   rename(lst = mean)
+```
+
+#### Census
+
+```{r}
+ census2 <- st_join(circles_sf, census, join = st_intersects)
+# 
+ census3 <- census2 |>
+   st_drop_geometry() |>
+   group_by(trap_id) |>
+   summarise(prop_minwage = mean(prop_minwage, na.rm = TRUE),
+             mean_income = mean(mean_income, na.rm = TRUE),
+             prop_hhminwage = mean(prop_hhminwage, na.rm = TRUE),
+             hhmean_income = mean(hhmean_income, na.rm = TRUE))
+```
+
+#### Join all
+
+```{r}
+trap_model_df_2 <- trap_model_df  |> 
+   left_join(pop, by = "trap_id") |>
+   left_join(elv_circles, by = "trap_id") |>
+   left_join(ugs_circles, by = "trap_id") |>
+   left_join(imperv_circles, by = "trap_id") |>
+   left_join(lst_circles, by = "trap_id") |>
+   left_join(census3, by = "trap_id")
+# 
+ #saveRDS(trap_model_df_2, "data/trap_model_df_2.rds")
+```
+
+
+
+
+```{r - covariate set-up}
+## Weather Covariates 
+meteo_week_3 <- meteo_week_2 %>%
+  group_by(year, week) %>%
+  summarize(wk_avg_tmax = mean(tmax, na.rm = T),
+            wk_avg_tmin = mean(tmin, na.rm = T),
+            wk_avg_tmean = mean(tmean, na.rm = T),
+            wk_avg_precipmean = mean(precipmean, na.rm = T),
+            wk_avg_preciptotal = mean(preciptotal, na.rm = T)) %>%
+  ungroup() %>%
+  mutate(wk_avg_tmax_lag1 = lag(wk_avg_tmax, 1),
+         wk_avg_tmax_lag2 = lag(wk_avg_tmax, 2),
+         wk_avg_tmax_lag3 = lag(wk_avg_tmax, 3),
+         wk_avg_tmax_lag4 = lag(wk_avg_tmax, 4),
+         wk_avg_tmax_lag5 = lag(wk_avg_tmax, 5),
+         wk_avg_tmax_lag6 = lag(wk_avg_tmax, 6),
+         wk_avg_tmax_lag7 = lag(wk_avg_tmax, 7),
+         wk_avg_tmax_lag8 = lag(wk_avg_tmax, 8),
+         wk_avg_tmin_lag1 = lag(wk_avg_tmin, 1),
+         wk_avg_tmin_lag2 = lag(wk_avg_tmin, 2),
+         wk_avg_tmin_lag3 = lag(wk_avg_tmin, 3),
+         wk_avg_tmin_lag4 = lag(wk_avg_tmin, 4),
+         wk_avg_tmin_lag5 = lag(wk_avg_tmin, 5),
+         wk_avg_tmin_lag6 = lag(wk_avg_tmin, 6),
+         wk_avg_tmin_lag7 = lag(wk_avg_tmin, 7),
+         wk_avg_tmin_lag8 = lag(wk_avg_tmin, 8),
+         wk_avg_tmean_lag1 = lag(wk_avg_tmean, 1),
+         wk_avg_tmean_lag2 = lag(wk_avg_tmean, 2),
+         wk_avg_tmean_lag3 = lag(wk_avg_tmean, 3),
+         wk_avg_tmean_lag4 = lag(wk_avg_tmean, 4),
+         wk_avg_tmean_lag5 = lag(wk_avg_tmean, 5),
+         wk_avg_tmean_lag6 = lag(wk_avg_tmean, 6),
+         wk_avg_tmean_lag7 = lag(wk_avg_tmean, 7),
+         wk_avg_tmean_lag8 = lag(wk_avg_tmean, 8),
+         wk_avg_precipmean_lag1 = lag(wk_avg_precipmean, 1),
+         wk_avg_precipmean_lag2 = lag(wk_avg_precipmean, 2),
+         wk_avg_precipmean_lag3 = lag(wk_avg_precipmean, 3),
+         wk_avg_precipmean_lag4 = lag(wk_avg_precipmean, 4),
+         wk_avg_precipmean_lag5 = lag(wk_avg_precipmean, 5),
+         wk_avg_precipmean_lag6 = lag(wk_avg_precipmean, 6),
+         wk_avg_precipmean_lag7 = lag(wk_avg_precipmean, 7),
+         wk_avg_precipmean_lag8 = lag(wk_avg_precipmean, 8),
+         wk_avg_preciptotal_lag1 = lag(wk_avg_preciptotal, 1),
+         wk_avg_preciptotal_lag2 = lag(wk_avg_preciptotal, 2),
+         wk_avg_preciptotal_lag3 = lag(wk_avg_preciptotal, 3),
+         wk_avg_preciptotal_lag4 = lag(wk_avg_preciptotal, 4),
+         wk_avg_preciptotal_lag5 = lag(wk_avg_preciptotal, 5),
+         wk_avg_preciptotal_lag6 = lag(wk_avg_preciptotal, 6),
+         wk_avg_preciptotal_lag7 = lag(wk_avg_preciptotal, 7),
+         wk_avg_preciptotal_lag8 = lag(wk_avg_preciptotal, 8))
+
+## Month and Season of First Release Covariates
+sp_temp_full_df <- trap_model_df_2 %>%
+  mutate(epiyear = epiyear(week.date), 
+         epiweek = epiweek(week.date)) %>%
+  left_join(meteo_week_3, by = c("epiyear" = "year", 
+                                  "epiweek" = "week")) |>
+  arrange(week.date) %>%
+  mutate(month = month(week.date),
+    season = if_else(month >= 5 & month <= 10, 
+                            "Dry Season", "Rainy Season"))
+
+#saveRDS(sp_temp_full_df, "data/sp_temp_full_df.rds")
+sp_temp_full_df <- readRDS("data/sp_temp_full_df.rds")
+
+```
+
+
+## Get Mozzies Rel Lag 0
+```{r - mozzies_rel_lag0}
+trapping_data_lag0 <- new_trapping_data %>%
+  filter(type == "BG") %>%
+  filter(successful == TRUE) %>%
+  filter(collected_at <= "2020-03-31") %>%
+  filter(screening_total_aeg > 0) %>%
+  mutate(area = substr(trap_id, 1, 3)) %>%
+  filter(area != "TUB") %>%
+  mutate(collected_at = as.Date(collected_at, format = "%Y/%m/%d"),
+         total_aegypti_caught = as.numeric(total_aegypti_caught), 
+         screening_total_aeg = as.numeric(screening_total_aeg), 
+         screening_wmel_aeg = as.numeric(screening_wmel_aeg), 
+         trap_wmel_prev = screening_wmel_aeg/screening_total_aeg, 
+         extrap_wmel = floor(trap_wmel_prev*total_aegypti_caught), 
+         week = week(collected_at), 
+         year = year(collected_at), 
+         week.date = floor_date(collected_at, unit = 'week')) %>%
+  ungroup() %>%
+  group_by(trap_id, week.date) %>%
+  mutate(trapping_events = n()) %>%
+  mutate(tot_aegypti = sum(total_aegypti_caught, na.rm = T), 
+            tot_aeg_screened = sum(screening_total_aeg, na.rm = T), 
+            tot_wmel_screened = sum(screening_wmel_aeg, na.rm = T), 
+            trap_avg_wmel_prev = mean(trap_wmel_prev, na.rm = T), 
+            trap_events = mean(trapping_events, na.rm = T), 
+            tot_wmel = sum(extrap_wmel, na.rm = T), 
+            reporting_area, 
+            latitude, 
+            longitude) %>%
+  mutate(norm_tot_aegypti = tot_aegypti/trap_events) %>%
+  ungroup() %>%
+    mutate(year = year(week.date), 
+           week = week(week.date)) %>%
+  distinct(trap_id, collected_at, .keep_all = T)
+
+trapping_data_lag0_sf <- st_as_sf(trapping_data_lag0, coords = c("longitude", "latitude"), crs = 4326) %>%
+  st_transform(crs = st_crs("+proj=utm +zone=23 +datum=WGS84 +units=m +no_defs")) 
+
+trapping_data_geom_lag0 <- trapping_data_lag0_sf %>%
+  dplyr::select(trap_id, geometry) %>%
+  distinct(trap_id, .keep_all = T)
+
+circles_lag0 <- st_buffer(trapping_data_geom_lag0, dist = 100)
+circles_sf_lag0 <- st_as_sf(circles_lag0)
+
+
+## lag 0
+## Combine releases with trap circles
+# count # release points in each circle
+rp_lag0 <- st_join(circles_sf_lag0, release_data_2, join = st_contains) 
+rp_2_lag0 <- as.data.frame(rp_lag0) %>%
+  group_by(date_of_release, trap_id) %>%
+  summarize(mozzies_rel_lag0.1 = sum(average_released, na.rm = T), 
+            n_release_points = n()) %>%
+  group_by(trap_id) %>%
+  arrange(date_of_release) %>%
+  mutate(mozzies_rel_lag0.1 = if_else(is.na(mozzies_rel_lag0.1), 0, mozzies_rel_lag0.1)) %>%
+  ungroup() %>%
+  mutate(week.date = floor_date(date_of_release, unit = 'week')) 
+
+## combine trapping and release data
+trapping_data_t2_lag0 <- full_join(trapping_data_lag0_sf, rp_2_lag0,
+                                      by = c("trap_id" = "trap_id", 
+                                             "week.date" = "week.date"))
+
+## filter out releases without trapping
+trapping_data_t3_lag0 <- trapping_data_t2_lag0 %>%
+  filter(!is.na(tot_aegypti)) %>%
+  mutate(tot_wmel = if_else(tot_aegypti == 0, 0, tot_wmel)) %>%
+    mutate(release_zone = if_else(grepl('RJ1', trap_id), "RJ1", "NA"), 
+         release_zone = if_else(grepl('RJ2', trap_id), "RJ2", release_zone), 
+         release_zone = if_else(grepl('RJ3.B1', trap_id) | 
+                                  grepl('RJ3.V1', trap_id), "RJ3.1", release_zone),
+         release_zone = if_else(grepl('RJ3.B2', trap_id) | 
+                                  grepl('RJ3.V2', trap_id), "RJ3.2", release_zone),
+         release_zone = if_else(grepl('RJ3.B3', trap_id) | 
+                                  grepl('RJ3.V3', trap_id), "RJ3.3", release_zone), 
+         release_zone = as.factor(release_zone))
+
+trapping_data_t4_lag0 <- as.data.frame(trapping_data_t3_lag0) %>%
+  mutate(mozzies_rel_lag0 = if_else(date_of_release <= collected_at, mozzies_rel_lag0.1, 0)) %>%
+  group_by(trap_id, week.date) %>%
+  summarize(mozzies_rel_lag0 = sum(mozzies_rel_lag0, na.rm = T)) %>%
+  ungroup()
+
+mozzies_rel_lag0_df <- trapping_data_t4_lag0 %>%
+  mutate(mozzies_rel_lag0_nz = if_else(mozzies_rel_lag0 == 0, NA_real_, mozzies_rel_lag0), 
+         mozzies_rel_lag0_binary = if_else(mozzies_rel_lag0 == 0, 0, 1))
+
+#saveRDS(mozzies_rel_lag0_df, "data/mozzies_rel_lag0_df.rds")
+
+```
+
+## Binary 
+```{r - binary}
+
+sp_temp_full_df_2 <- sp_temp_full_df %>%
+  group_by(trap_id) %>%
+  arrange(week.date) %>%
+   mutate(binary_mozzies_rel = if_else(mozzies_rel > 0, 1, 0), 
+          binary_mozzies_rel = if_else(is.na(mozzies_rel), 0,
+                                       binary_mozzies_rel), 
+          binary_mozzies_rel_lag1 = if_else(mozzies_rel_lag1 > 0, 1, 0),
+          binary_mozzies_rel_lag1 = if_else(is.na(mozzies_rel_lag1), 0,
+                                       binary_mozzies_rel_lag1), 
+          binary_mozzies_rel_lag2 = if_else(mozzies_rel_lag2 > 0, 1, 0),
+          binary_mozzies_rel_lag2 = if_else(is.na(mozzies_rel_lag2), 0,
+                                       binary_mozzies_rel_lag2), 
+          binary_mozzies_rel_lag3 = if_else(mozzies_rel_lag3 > 0, 1, 0),
+          binary_mozzies_rel_lag3 = if_else(is.na(mozzies_rel_lag3), 0,
+                                       binary_mozzies_rel_lag3), 
+          binary_mozzies_rel_lag4 = if_else(mozzies_rel_lag4 > 0, 1, 0),
+          binary_mozzies_rel_lag4 = if_else(is.na(mozzies_rel_lag4), 0,
+                                       binary_mozzies_rel_lag4), 
+          binary_mozzies_rel_lag5 = if_else(mozzies_rel_lag5 > 0, 1, 0),
+          binary_mozzies_rel_lag5 = if_else(is.na(mozzies_rel_lag5), 0,
+                                       binary_mozzies_rel_lag5), 
+          binary_mozzies_rel_lag6 = if_else(mozzies_rel_lag6 > 0, 1, 0),
+          binary_mozzies_rel_lag6 = if_else(is.na(mozzies_rel_lag6), 0,
+                                       binary_mozzies_rel_lag6), 
+          binary_mozzies_rel_lag7 = if_else(mozzies_rel_lag7 > 0, 1, 0),
+          binary_mozzies_rel_lag7 = if_else(is.na(mozzies_rel_lag7), 0,
+                                       binary_mozzies_rel_lag7), 
+          binary_mozzies_rel_lag8 = if_else(mozzies_rel_lag8 > 0, 1, 0),
+          binary_mozzies_rel_lag8 = if_else(is.na(mozzies_rel_lag8), 0,
+                                       binary_mozzies_rel_lag8), 
+          log_mozzies_rel_nz = if_else(log_mozzies_rel == 0, NA_real_,
+                                       log_mozzies_rel), 
+          log_mozzies_rel_lag1_nz = if_else(log_mozzies_rel_lag1 == 0, NA_real_,
+                                       log_mozzies_rel_lag1),
+          log_mozzies_rel_lag2_nz = if_else(log_mozzies_rel_lag2 == 0, NA_real_,
+                                       log_mozzies_rel_lag2),
+          log_mozzies_rel_lag3_nz = if_else(log_mozzies_rel_lag3 == 0, NA_real_,
+                                       log_mozzies_rel_lag3),
+          log_mozzies_rel_lag4_nz = if_else(log_mozzies_rel_lag4 == 0, NA_real_,
+                                       log_mozzies_rel_lag4),
+          log_mozzies_rel_lag5_nz = if_else(log_mozzies_rel_lag5 == 0, NA_real_,
+                                       log_mozzies_rel_lag5),
+          log_mozzies_rel_lag6_nz = if_else(log_mozzies_rel_lag6 == 0, NA_real_,
+                                       log_mozzies_rel_lag6),
+          log_mozzies_rel_lag7_nz = if_else(log_mozzies_rel_lag7 == 0, NA_real_,
+                                       log_mozzies_rel_lag7),
+          log_mozzies_rel_lag8_nz = if_else(log_mozzies_rel_lag8 == 0, NA_real_,
+                                       log_mozzies_rel_lag8)) %>%
+  ungroup()
+
+#saveRDS(sp_temp_full_df_2, "data/sp_temp_full_df_2.rds")
+
+sp_temp_full_df_2 <- readRDS("data/sp_temp_full_df_2.rds")
+mozzies_rel_lag0_df <- readRDS("data/mozzies_rel_lag0_df.rds")
+
+## get x and y coordinates
+sp_temp_full_df_2$x <- st_coordinates(sp_temp_full_df_2$geometry)[,1]
+sp_temp_full_df_2$y <- st_coordinates(sp_temp_full_df_2$geometry)[,2]
+
+sp_temp_full_df_3 <- as.data.frame(sp_temp_full_df_2) %>%
+  dplyr::select(-(geometry))
+
+## set non-linear terms
+sp_temp_full_df_3$log_tot_aegypti_lag1_bin <- 
+  inla.group(sp_temp_full_df_3$log_tot_aegypti_lag1, n = 5, method = "quantile")
+sp_temp_full_df_3$log_tot_aegypti_lag2_bin <- 
+  inla.group(sp_temp_full_df_3$log_tot_aegypti_lag2, n = 5, method = "quantile")
+
+## set season and month as factors
+sp_temp_full_df_3 <- sp_temp_full_df_3 %>%
+  mutate(season = as.factor(season), 
+         month = as.factor(month))
+
+sp_temp_full_df_4 <- left_join(sp_temp_full_df_3, mozzies_rel_lag0_df, 
+                               by = c("trap_id" = "trap_id", 
+                                      "week.date" = "week.date"))
+
+sp_temp_full_df_5 <- sp_temp_full_df_4 %>%
+  mutate(log_mozzies_rel_lag0 = log(mozzies_rel_lag0), 
+         log_mozzies_rel_lag0 = if_else(log_mozzies_rel_lag0 == -Inf, 0, log_mozzies_rel_lag0), 
+         log_mozzies_rel_lag0_nz = log(mozzies_rel_lag0_nz), 
+         log_mozzies_rel_lag0_nz = if_else(log_mozzies_rel_lag0_nz == -Inf, NA_real_,
+                                           log_mozzies_rel_lag0_nz))
+
+
+
+```
+
+## Add MRR and trap caught abundance at time 1
+```{r - non-temporally varying abundance}
+mrr_abun_2 <- mrr_abun %>%
+  dplyr::select(trap_id, total_aegypti_caught, ff, lpi)
+
+mrr_abun_2 <- mrr_abun_2 %>%
+  rename(trap_abun = total_aegypti_caught)
+
+sp_temp_full_df_6 <- left_join(sp_temp_full_df_5, mrr_abun_2, 
+                               by = c("trap_id" = "trap_id"))
+
+## get t_week
+trapping_data_weeks <- trapping_data_2 %>%
+  dplyr::select(week.date) %>%
+  distinct(week.date) %>%
+  arrange(week.date) %>%
+  mutate(t_week = row_number())
+
+trapping_data_months <- trapping_data_2 %>%
+  mutate(month = month(week.date)) %>%
+  dplyr::select(month, year, week.date) %>%
+  distinct(month, year, .keep_all = T) %>%
+  arrange(year, month) %>%
+  mutate(t_month = row_number()) %>%
+  dplyr::select(year, month, t_month) %>%
+  mutate(month = as.factor(month))
+
+sp_temp_full_df_7 <- left_join(sp_temp_full_df_6, trapping_data_weeks, 
+                               by = c("week.date" = "week.date"))
+
+sp_temp_full_df_8 <- left_join(sp_temp_full_df_7, trapping_data_months, 
+                               by = c("year" = "year", 
+                                      "month" = "month"))
+
+sp_temp_full_df_3 <- sp_temp_full_df_8 %>%
+  mutate(t_year = if_else(year == 2017, 1, NA), 
+         t_year = if_else(year == 2018, 2, t_year), 
+         t_year = if_else(year == 2019, 3, t_year), 
+         t_year = if_else(year == 2020, 4, t_year), 
+      t_season = if_else(season == "Dry Season" & year == 2017, 1, NA), 
+      t_season = if_else(season == "Rainy Season" & year == 2017, 2, t_year),
+      t_season = if_else(season == "Dry Season" & year == 2018, 3, t_year),
+      t_season = if_else(season == "Rainy Season" & year == 2018, 4, t_year),
+      t_season = if_else(season == "Dry Season" & year == 2019, 5, t_year),
+      t_season = if_else(season == "Rainy Season" & year == 2019, 6, t_year),
+      t_season = if_else(season == "Dry Season" & year == 2020, 7, t_year),
+      t_season = if_else(season == "Rainy Season" & year == 2020, 8, t_year))
+
+saveRDS(sp_temp_full_df_3, "data/sp_temp_full_df_3.rds")
+
+```
+## 50m radius
+```{r - 50m radius}
+
+## Create Circles
+# circles with radius 100m
+circles_50 <- st_buffer(trapping_data_geom, dist = 50)
+circles_50_sf <- st_as_sf(circles_50)
+
+## get distinct release points
+new_release_data_2 <- st_as_sf(new_release_data, coords = c("longitude", "latitude"), crs = 4326) %>%
+  st_transform(crs = st_crs("+proj=utm +zone=23 +datum=WGS84 +units=m +no_defs")) %>%
+  filter(date_of_release <= "2020-03-31")
+
+# side data frame to get each release location 
+release_data_2 <- new_release_data_2 %>%
+  filter(type_of_release == "Adult") 
+
+new_release_data_3 <- st_as_sf(release_data_2, coords = c("longitude", "latitude"), crs = 4326) %>%
+  st_transform(crs = st_crs("+proj=utm +zone=23 +datum=WGS84 +units=m +no_defs"))
+  
+## Combine releases with trap circles
+# count # release points in each circle
+rp_50 <- st_join(circles_50_sf, release_data_2, join = st_contains) 
+rp_50_2 <- as.data.frame(rp_50) %>%
+  dplyr::select(-(geometry)) %>%
+  dplyr::select(-(type_of_release)) %>%
+  mutate(week.date = floor_date(date_of_release, unit = 'week')) %>%
+  group_by(week.date, trap_id) %>%
+  summarize(mozzies_rel = sum(average_released, na.rm = T), 
+            n_release_points = n()) %>%
+  group_by(trap_id) %>%
+  arrange(week.date) %>%
+  mutate(mozzies_rel = if_else(is.na(mozzies_rel), 0, mozzies_rel), 
+         mozzies_rel_plus1 = mozzies_rel+1,
+         mozzies_rel_lag1 = lag(mozzies_rel, 1), 
+         mozzies_rel_lag1 = if_else(is.na(mozzies_rel_lag1), 0, mozzies_rel_lag1),
+         mozzies_rel_plus1_lag1 = lag(mozzies_rel_plus1, 1),
+         mozzies_rel_lag2 = lag(mozzies_rel, 2),
+         mozzies_rel_lag2 = if_else(is.na(mozzies_rel_lag2), 0, mozzies_rel_lag2),
+         mozzies_rel_plus1_lag2 = lag(mozzies_rel_plus1, 2),
+         mozzies_rel_lag3 = lag(mozzies_rel, 3), 
+         mozzies_rel_lag3 = if_else(is.na(mozzies_rel_lag3), 0, mozzies_rel_lag3),
+         mozzies_rel_plus1_lag3 = lag(mozzies_rel_plus1, 3),
+         mozzies_rel_lag4 = lag(mozzies_rel, 4), 
+         mozzies_rel_lag4 = if_else(is.na(mozzies_rel_lag4), 0, mozzies_rel_lag4),
+         mozzies_rel_plus1_lag4 = lag(mozzies_rel_plus1, 4),
+         mozzies_rel_lag5 = lag(mozzies_rel, 5), 
+         mozzies_rel_lag5 = if_else(is.na(mozzies_rel_lag5), 0, mozzies_rel_lag5),
+         mozzies_rel_plus1_lag5 = lag(mozzies_rel_plus1, 5),
+         mozzies_rel_lag6 = lag(mozzies_rel, 6), 
+         mozzies_rel_lag6 = if_else(is.na(mozzies_rel_lag6), 0, mozzies_rel_lag6),
+         mozzies_rel_plus1_lag6 = lag(mozzies_rel_plus1, 6),
+         mozzies_rel_lag7 = lag(mozzies_rel, 7), 
+         mozzies_rel_lag7 = if_else(is.na(mozzies_rel_lag7), 0, mozzies_rel_lag7),
+         mozzies_rel_plus1_lag7 = lag(mozzies_rel_plus1, 7),
+         mozzies_rel_lag8 = lag(mozzies_rel, 8), 
+         mozzies_rel_lag8 = if_else(is.na(mozzies_rel_lag8), 0, mozzies_rel_lag8), 
+         mozzies_rel_plus1_lag8 = lag(mozzies_rel_plus1, 8)) %>%
+  ungroup() 
+
+## get first release date
+rel_first_50 <- rp_50_2 %>%
+  filter(mozzies_rel > 0) %>%
+  group_by(trap_id) %>%
+  mutate(n = row_number(), 
+         first_rel_date = if_else(n == 1, week.date, NA), 
+         full_first_rel_date = mean(first_rel_date, na.rm = T),
+         t_since_first_rel = difftime(week.date, full_first_rel_date, units = "weeks"), 
+         t_since_first_rel = as.numeric(t_since_first_rel)) %>%
+  ungroup() %>%
+  dplyr::select(week.date, trap_id, t_since_first_rel) 
+
+rp_50_3 <- left_join(rp_50_2, rel_first_50, by = c("trap_id" = "trap_id", "week.date" = "week.date"))
+
+## combine trapping and release data
+trapping_data_50_t2 <- full_join(weekly_trapping_data_sf, rp_50_3,
+                                      by = c("trap_id" = "trap_id", 
+                                             "week.date" = "week.date"))
+
+## filter out releases without trapping
+trapping_data_50_t3 <- trapping_data_50_t2 %>%
+  filter(!is.na(tot_aegypti)) %>%
+  mutate(tot_wmel = if_else(tot_aegypti == 0, 0, tot_wmel)) %>%
+    mutate(release_zone = if_else(grepl('RJ1', trap_id), "RJ1", "NA"), 
+         release_zone = if_else(grepl('RJ2', trap_id), "RJ2", release_zone), 
+         release_zone = if_else(grepl('RJ3.B1', trap_id) | 
+                                  grepl('RJ3.V1', trap_id), "RJ3.1", release_zone),
+         release_zone = if_else(grepl('RJ3.B2', trap_id) | 
+                                  grepl('RJ3.V2', trap_id), "RJ3.2", release_zone),
+         release_zone = if_else(grepl('RJ3.B3', trap_id) | 
+                                  grepl('RJ3.V3', trap_id), "RJ3.3", release_zone), 
+         release_zone = as.factor(release_zone))
+
+
+trap_model_50_df <- trapping_data_50_t3 %>%
+  mutate(trap_id = as.factor(trap_id), 
+         release_zone = as.factor(release_zone)) %>%
+  ungroup() %>%
+  arrange(week.date) %>%
+  group_by(trap_id) %>%
+  mutate(wmel_prev_lag1 = lag(trap_avg_wmel_prev, 1), 
+         wmel_prev_lag2 = lag(trap_avg_wmel_prev, 2), 
+         wmel_prev_lag3 = lag(trap_avg_wmel_prev, 3), 
+         wmel_prev_lag4 = lag(trap_avg_wmel_prev, 4),
+         wmel_prev_lag5 = lag(trap_avg_wmel_prev, 5),
+         wmel_prev_lag6 = lag(trap_avg_wmel_prev, 6),
+         wmel_prev_lag7 = lag(trap_avg_wmel_prev, 7),
+         wmel_prev_lag8 = lag(trap_avg_wmel_prev, 8), 
+         log_mozzies_rel = log(mozzies_rel), 
+         log_mozzies_rel = if_else(log_mozzies_rel == -Inf, 0, log_mozzies_rel), 
+         log_mozzies_rel_lag1 = log(mozzies_rel_lag1), 
+         log_mozzies_rel_lag1 = if_else(log_mozzies_rel_lag1 == -Inf, 0, log_mozzies_rel_lag1), 
+         log_mozzies_rel_lag2 = log(mozzies_rel_lag2), 
+         log_mozzies_rel_lag2 = if_else(log_mozzies_rel_lag2 == -Inf, 0, log_mozzies_rel_lag2),
+         log_mozzies_rel_lag3 = log(mozzies_rel_lag3), 
+         log_mozzies_rel_lag3 = if_else(log_mozzies_rel_lag3 == -Inf, 0, log_mozzies_rel_lag3), 
+         log_mozzies_rel_lag4 = log(mozzies_rel_lag4), 
+         log_mozzies_rel_lag4 = if_else(log_mozzies_rel_lag4 == -Inf, 0, log_mozzies_rel_lag4), 
+         log_mozzies_rel_lag5 = log(mozzies_rel_lag5), 
+         log_mozzies_rel_lag5 = if_else(log_mozzies_rel_lag5 == -Inf, 0, log_mozzies_rel_lag5), 
+         log_mozzies_rel_lag6 = log(mozzies_rel_lag6), 
+         log_mozzies_rel_lag6 = if_else(log_mozzies_rel_lag6 == -Inf, 0, log_mozzies_rel_lag6), 
+         log_mozzies_rel_lag7 = log(mozzies_rel_lag7), 
+         log_mozzies_rel_lag7 = if_else(log_mozzies_rel_lag7 == -Inf, 0, log_mozzies_rel_lag7), 
+         log_mozzies_rel_lag8 = log(mozzies_rel_lag8), 
+         log_mozzies_rel_lag8 = if_else(log_mozzies_rel_lag8 == -Inf, 0, log_mozzies_rel_lag8), 
+         log_tot_aegypti = log(tot_aegypti), 
+         log_tot_aegypti = if_else(log_tot_aegypti == -Inf, 0, log_tot_aegypti), 
+         log_tot_aegypti_lag1 = lag(log_tot_aegypti, 1),
+         log_tot_aegypti_lag2 = lag(log_tot_aegypti, 2),
+         log_tot_aegypti_lag3 = lag(log_tot_aegypti, 3),
+         log_tot_aegypti_lag4 = lag(log_tot_aegypti, 4),
+         log_tot_aegypti_lag5 = lag(log_tot_aegypti, 5),
+         log_tot_aegypti_lag6 = lag(log_tot_aegypti, 6),
+         log_tot_aegypti_lag7 = lag(log_tot_aegypti, 7),
+         log_tot_aegypti_lag8 = lag(log_tot_aegypti, 8)) %>%
+  ungroup() 
+
+## covariates
+pop <- covariate_gbmt %>%
+  dplyr::select(trap_id, pop_sum)
+
+elv_circles_50 <- exact_extract(elevation, circles_50_sf, fun = "mean", append_cols = "trap_id", progress = FALSE) |> 
+   rename(elev = mean)
+ 
+ugs_circles_50 <- exact_extract(ugs, circles_50_sf, fun = "sum", append_cols = "trap_id", progress = FALSE) |>
+   mutate(ugs_m = sum*10,
+          ugs_perc = ugs_m/(pi*100^2)*100) |>
+   dplyr::select(-sum)
+
+imperv_perc <- terra::classify(imperv, rbind(c(200, NA), c(255, NA)))
+ 
+imperv_circles_50 <- exact_extract(imperv_perc, circles_50_sf, fun = "mean", append_cols = "trap_id", progress = FALSE) |> 
+   rename(imperv_perc = mean)
+
+lst_circles_50 <- exact_extract(lst, circles_50_sf, fun = "mean", append_cols = "trap_id", progress = FALSE) |> 
+   rename(lst = mean)
+
+census2_50 <- st_join(circles_50_sf, census, join = st_intersects)
+ 
+census3_50 <- census2_50 |>
+   st_drop_geometry() |>
+   group_by(trap_id) |>
+   summarise(prop_minwage = mean(prop_minwage, na.rm = TRUE),
+             mean_income = mean(mean_income, na.rm = TRUE),
+             prop_hhminwage = mean(prop_hhminwage, na.rm = TRUE),
+             hhmean_income = mean(hhmean_income, na.rm = TRUE))
+
+trap_model_50_df_2 <- trap_model_50_df  |> 
+   left_join(pop, by = "trap_id") |>
+   left_join(elv_circles_50, by = "trap_id") |>
+   left_join(ugs_circles_50, by = "trap_id") |>
+   left_join(imperv_circles_50, by = "trap_id") |>
+   left_join(lst_circles_50, by = "trap_id") |>
+   left_join(census3_50, by = "trap_id")
+
+## Weather Covariates 
+meteo_week_3 <- meteo_week_2 %>%
+  group_by(year, week) %>%
+  summarize(wk_avg_tmax = mean(tmax, na.rm = T),
+            wk_avg_tmin = mean(tmin, na.rm = T),
+            wk_avg_tmean = mean(tmean, na.rm = T),
+            wk_avg_precipmean = mean(precipmean, na.rm = T),
+            wk_avg_preciptotal = mean(preciptotal, na.rm = T)) %>%
+  ungroup() %>%
+  mutate(wk_avg_tmax_lag1 = lag(wk_avg_tmax, 1),
+         wk_avg_tmax_lag2 = lag(wk_avg_tmax, 2),
+         wk_avg_tmax_lag3 = lag(wk_avg_tmax, 3),
+         wk_avg_tmax_lag4 = lag(wk_avg_tmax, 4),
+         wk_avg_tmax_lag5 = lag(wk_avg_tmax, 5),
+         wk_avg_tmax_lag6 = lag(wk_avg_tmax, 6),
+         wk_avg_tmax_lag7 = lag(wk_avg_tmax, 7),
+         wk_avg_tmax_lag8 = lag(wk_avg_tmax, 8),
+         wk_avg_tmin_lag1 = lag(wk_avg_tmin, 1),
+         wk_avg_tmin_lag2 = lag(wk_avg_tmin, 2),
+         wk_avg_tmin_lag3 = lag(wk_avg_tmin, 3),
+         wk_avg_tmin_lag4 = lag(wk_avg_tmin, 4),
+         wk_avg_tmin_lag5 = lag(wk_avg_tmin, 5),
+         wk_avg_tmin_lag6 = lag(wk_avg_tmin, 6),
+         wk_avg_tmin_lag7 = lag(wk_avg_tmin, 7),
+         wk_avg_tmin_lag8 = lag(wk_avg_tmin, 8),
+         wk_avg_tmean_lag1 = lag(wk_avg_tmean, 1),
+         wk_avg_tmean_lag2 = lag(wk_avg_tmean, 2),
+         wk_avg_tmean_lag3 = lag(wk_avg_tmean, 3),
+         wk_avg_tmean_lag4 = lag(wk_avg_tmean, 4),
+         wk_avg_tmean_lag5 = lag(wk_avg_tmean, 5),
+         wk_avg_tmean_lag6 = lag(wk_avg_tmean, 6),
+         wk_avg_tmean_lag7 = lag(wk_avg_tmean, 7),
+         wk_avg_tmean_lag8 = lag(wk_avg_tmean, 8),
+         wk_avg_precipmean_lag1 = lag(wk_avg_precipmean, 1),
+         wk_avg_precipmean_lag2 = lag(wk_avg_precipmean, 2),
+         wk_avg_precipmean_lag3 = lag(wk_avg_precipmean, 3),
+         wk_avg_precipmean_lag4 = lag(wk_avg_precipmean, 4),
+         wk_avg_precipmean_lag5 = lag(wk_avg_precipmean, 5),
+         wk_avg_precipmean_lag6 = lag(wk_avg_precipmean, 6),
+         wk_avg_precipmean_lag7 = lag(wk_avg_precipmean, 7),
+         wk_avg_precipmean_lag8 = lag(wk_avg_precipmean, 8),
+         wk_avg_preciptotal_lag1 = lag(wk_avg_preciptotal, 1),
+         wk_avg_preciptotal_lag2 = lag(wk_avg_preciptotal, 2),
+         wk_avg_preciptotal_lag3 = lag(wk_avg_preciptotal, 3),
+         wk_avg_preciptotal_lag4 = lag(wk_avg_preciptotal, 4),
+         wk_avg_preciptotal_lag5 = lag(wk_avg_preciptotal, 5),
+         wk_avg_preciptotal_lag6 = lag(wk_avg_preciptotal, 6),
+         wk_avg_preciptotal_lag7 = lag(wk_avg_preciptotal, 7),
+         wk_avg_preciptotal_lag8 = lag(wk_avg_preciptotal, 8))
+
+## Month and Season of First Release Covariates
+sp_temp_full_df_50 <- trap_model_50_df_2 %>%
+  mutate(epiyear = epiyear(week.date), 
+         epiweek = epiweek(week.date)) %>%
+  left_join(meteo_week_3, by = c("epiyear" = "year", 
+                                  "epiweek" = "week")) |>
+  arrange(week.date) %>%
+  mutate(month = month(week.date),
+    season = if_else(month >= 5 & month <= 10, 
+                            "Dry Season", "Rainy Season"))
+
+
+## trapping data
+trapping_data_lag0 <- new_trapping_data %>%
+  filter(type == "BG") %>%
+  filter(successful == TRUE) %>%
+  filter(collected_at <= "2020-03-31") %>%
+  filter(screening_total_aeg > 0) %>%
+  mutate(area = substr(trap_id, 1, 3)) %>%
+  filter(area != "TUB") %>%
+  mutate(collected_at = as.Date(collected_at, format = "%Y/%m/%d"),
+         total_aegypti_caught = as.numeric(total_aegypti_caught), 
+         screening_total_aeg = as.numeric(screening_total_aeg), 
+         screening_wmel_aeg = as.numeric(screening_wmel_aeg), 
+         trap_wmel_prev = screening_wmel_aeg/screening_total_aeg, 
+         extrap_wmel = floor(trap_wmel_prev*total_aegypti_caught), 
+         week = week(collected_at), 
+         year = year(collected_at), 
+         week.date = floor_date(collected_at, unit = 'week')) %>%
+  ungroup() %>%
+  group_by(trap_id, week.date) %>%
+  mutate(trapping_events = n()) %>%
+  mutate(tot_aegypti = sum(total_aegypti_caught, na.rm = T), 
+            tot_aeg_screened = sum(screening_total_aeg, na.rm = T), 
+            tot_wmel_screened = sum(screening_wmel_aeg, na.rm = T), 
+            trap_avg_wmel_prev = mean(trap_wmel_prev, na.rm = T), 
+            trap_events = mean(trapping_events, na.rm = T), 
+            tot_wmel = sum(extrap_wmel, na.rm = T), 
+            reporting_area, 
+            latitude, 
+            longitude) %>%
+  mutate(norm_tot_aegypti = tot_aegypti/trap_events) %>%
+  ungroup() %>%
+    mutate(year = year(week.date), 
+           week = week(week.date)) %>%
+  distinct(trap_id, collected_at, .keep_all = T)
+
+trapping_data_lag0_sf <- st_as_sf(trapping_data_lag0, coords = c("longitude", "latitude"), crs = 4326) %>%
+  st_transform(crs = st_crs("+proj=utm +zone=23 +datum=WGS84 +units=m +no_defs")) 
+
+trapping_data_geom_lag0 <- trapping_data_lag0_sf %>%
+  dplyr::select(trap_id, geometry) %>%
+  distinct(trap_id, .keep_all = T)
+
+circles_lag0_50 <- st_buffer(trapping_data_geom_lag0, dist = 50)
+circles_sf_lag0_50 <- st_as_sf(circles_lag0_50)
+
+
+## lag 0
+## Combine releases with trap circles
+# count # release points in each circle
+rp_lag0_50 <- st_join(circles_sf_lag0_50, release_data_2, join = st_contains) 
+rp_2_lag0_50 <- as.data.frame(rp_lag0_50) %>%
+  group_by(date_of_release, trap_id) %>%
+  summarize(mozzies_rel_lag0.1 = sum(average_released, na.rm = T), 
+            n_release_points = n()) %>%
+  group_by(trap_id) %>%
+  arrange(date_of_release) %>%
+  mutate(mozzies_rel_lag0.1 = if_else(is.na(mozzies_rel_lag0.1), 0, mozzies_rel_lag0.1)) %>%
+  ungroup() %>%
+  mutate(week.date = floor_date(date_of_release, unit = 'week')) 
+
+## combine trapping and release data
+trapping_data_t2_lag0_50 <- full_join(trapping_data_lag0_sf, rp_2_lag0_50,
+                                      by = c("trap_id" = "trap_id", 
+                                             "week.date" = "week.date"))
+
+## filter out releases without trapping
+trapping_data_t3_lag0_50 <- trapping_data_t2_lag0_50 %>%
+  filter(!is.na(tot_aegypti)) %>%
+  mutate(tot_wmel = if_else(tot_aegypti == 0, 0, tot_wmel)) %>%
+    mutate(release_zone = if_else(grepl('RJ1', trap_id), "RJ1", "NA"), 
+         release_zone = if_else(grepl('RJ2', trap_id), "RJ2", release_zone), 
+         release_zone = if_else(grepl('RJ3.B1', trap_id) | 
+                                  grepl('RJ3.V1', trap_id), "RJ3.1", release_zone),
+         release_zone = if_else(grepl('RJ3.B2', trap_id) | 
+                                  grepl('RJ3.V2', trap_id), "RJ3.2", release_zone),
+         release_zone = if_else(grepl('RJ3.B3', trap_id) | 
+                                  grepl('RJ3.V3', trap_id), "RJ3.3", release_zone), 
+         release_zone = as.factor(release_zone))
+
+trapping_data_t4_lag0_50 <- as.data.frame(trapping_data_t3_lag0_50) %>%
+  mutate(mozzies_rel_lag0 = if_else(date_of_release <= collected_at, mozzies_rel_lag0.1, 0)) %>%
+  group_by(trap_id, week.date) %>%
+  summarize(mozzies_rel_lag0 = sum(mozzies_rel_lag0, na.rm = T)) %>%
+  ungroup()
+
+mozzies_rel_lag0_df_50 <- trapping_data_t4_lag0_50 %>%
+  mutate(mozzies_rel_lag0_nz = if_else(mozzies_rel_lag0 == 0, NA_real_, mozzies_rel_lag0), 
+         mozzies_rel_lag0_binary = if_else(mozzies_rel_lag0 == 0, 0, 1))
+
+
+## Binary
+sp_temp_full_df_50_2 <- sp_temp_full_df_50 %>%
+  group_by(trap_id) %>%
+  arrange(week.date) %>%
+   mutate(binary_mozzies_rel = if_else(mozzies_rel > 0, 1, 0), 
+          binary_mozzies_rel = if_else(is.na(mozzies_rel), 0,
+                                       binary_mozzies_rel), 
+          binary_mozzies_rel_lag1 = if_else(mozzies_rel_lag1 > 0, 1, 0),
+          binary_mozzies_rel_lag1 = if_else(is.na(mozzies_rel_lag1), 0,
+                                       binary_mozzies_rel_lag1), 
+          binary_mozzies_rel_lag2 = if_else(mozzies_rel_lag2 > 0, 1, 0),
+          binary_mozzies_rel_lag2 = if_else(is.na(mozzies_rel_lag2), 0,
+                                       binary_mozzies_rel_lag2), 
+          binary_mozzies_rel_lag3 = if_else(mozzies_rel_lag3 > 0, 1, 0),
+          binary_mozzies_rel_lag3 = if_else(is.na(mozzies_rel_lag3), 0,
+                                       binary_mozzies_rel_lag3), 
+          binary_mozzies_rel_lag4 = if_else(mozzies_rel_lag4 > 0, 1, 0),
+          binary_mozzies_rel_lag4 = if_else(is.na(mozzies_rel_lag4), 0,
+                                       binary_mozzies_rel_lag4), 
+          binary_mozzies_rel_lag5 = if_else(mozzies_rel_lag5 > 0, 1, 0),
+          binary_mozzies_rel_lag5 = if_else(is.na(mozzies_rel_lag5), 0,
+                                       binary_mozzies_rel_lag5), 
+          binary_mozzies_rel_lag6 = if_else(mozzies_rel_lag6 > 0, 1, 0),
+          binary_mozzies_rel_lag6 = if_else(is.na(mozzies_rel_lag6), 0,
+                                       binary_mozzies_rel_lag6), 
+          binary_mozzies_rel_lag7 = if_else(mozzies_rel_lag7 > 0, 1, 0),
+          binary_mozzies_rel_lag7 = if_else(is.na(mozzies_rel_lag7), 0,
+                                       binary_mozzies_rel_lag7), 
+          binary_mozzies_rel_lag8 = if_else(mozzies_rel_lag8 > 0, 1, 0),
+          binary_mozzies_rel_lag8 = if_else(is.na(mozzies_rel_lag8), 0,
+                                       binary_mozzies_rel_lag8), 
+          log_mozzies_rel_nz = if_else(log_mozzies_rel == 0, NA_real_,
+                                       log_mozzies_rel), 
+          log_mozzies_rel_lag1_nz = if_else(log_mozzies_rel_lag1 == 0, NA_real_,
+                                       log_mozzies_rel_lag1),
+          log_mozzies_rel_lag2_nz = if_else(log_mozzies_rel_lag2 == 0, NA_real_,
+                                       log_mozzies_rel_lag2),
+          log_mozzies_rel_lag3_nz = if_else(log_mozzies_rel_lag3 == 0, NA_real_,
+                                       log_mozzies_rel_lag3),
+          log_mozzies_rel_lag4_nz = if_else(log_mozzies_rel_lag4 == 0, NA_real_,
+                                       log_mozzies_rel_lag4),
+          log_mozzies_rel_lag5_nz = if_else(log_mozzies_rel_lag5 == 0, NA_real_,
+                                       log_mozzies_rel_lag5),
+          log_mozzies_rel_lag6_nz = if_else(log_mozzies_rel_lag6 == 0, NA_real_,
+                                       log_mozzies_rel_lag6),
+          log_mozzies_rel_lag7_nz = if_else(log_mozzies_rel_lag7 == 0, NA_real_,
+                                       log_mozzies_rel_lag7),
+          log_mozzies_rel_lag8_nz = if_else(log_mozzies_rel_lag8 == 0, NA_real_,
+                                       log_mozzies_rel_lag8)) %>%
+  ungroup()
+
+
+## get x and y coordinates
+sp_temp_full_df_50_2$x <- st_coordinates(sp_temp_full_df_50_2$geometry)[,1]
+sp_temp_full_df_50_2$y <- st_coordinates(sp_temp_full_df_50_2$geometry)[,2]
+
+sp_temp_full_df_50_3 <- as.data.frame(sp_temp_full_df_50_2) %>%
+  dplyr::select(-(geometry))
+
+## set non-linear terms
+sp_temp_full_df_50_3$log_tot_aegypti_lag1_bin <- 
+  inla.group(sp_temp_full_df_50_3$log_tot_aegypti_lag1, n = 5, method = "quantile")
+sp_temp_full_df_50_3$log_tot_aegypti_lag2_bin <- 
+  inla.group(sp_temp_full_df_50_3$log_tot_aegypti_lag2, n = 5, method = "quantile")
+
+## set season and month as factors
+sp_temp_full_df_50_3 <- sp_temp_full_df_50_3 %>%
+  mutate(season = as.factor(season), 
+         month = as.factor(month))
+
+sp_temp_full_df_50_4 <- left_join(sp_temp_full_df_50_3, mozzies_rel_lag0_df_50, 
+                               by = c("trap_id" = "trap_id", 
+                                      "week.date" = "week.date"))
+
+sp_temp_full_df_50_5 <- sp_temp_full_df_50_4 %>%
+  mutate(log_mozzies_rel_lag0 = log(mozzies_rel_lag0), 
+         log_mozzies_rel_lag0 = if_else(log_mozzies_rel_lag0 == -Inf, 0, log_mozzies_rel_lag0), 
+         log_mozzies_rel_lag0_nz = log(mozzies_rel_lag0_nz), 
+         log_mozzies_rel_lag0_nz = if_else(log_mozzies_rel_lag0_nz == -Inf, NA_real_,
+                                           log_mozzies_rel_lag0_nz))
+
+## Add MRR and AR1 terms
+mrr_abun_2 <- mrr_abun %>%
+  dplyr::select(trap_id, total_aegypti_caught, ff, lpi)
+
+mrr_abun_2 <- mrr_abun_2 %>%
+  rename(trap_abun = total_aegypti_caught)
+
+sp_temp_full_df_50_6 <- left_join(sp_temp_full_df_50_5, mrr_abun_2, 
+                               by = c("trap_id" = "trap_id"))
+
+## get t_week
+trapping_data_weeks <- trapping_data_2 %>%
+  dplyr::select(week.date) %>%
+  distinct(week.date) %>%
+  arrange(week.date) %>%
+  mutate(t_week = row_number())
+
+trapping_data_months <- trapping_data_2 %>%
+  mutate(month = month(week.date)) %>%
+  dplyr::select(month, year, week.date) %>%
+  distinct(month, year, .keep_all = T) %>%
+  arrange(year, month) %>%
+  mutate(t_month = row_number()) %>%
+  dplyr::select(year, month, t_month) %>%
+  mutate(month = as.factor(month))
+
+sp_temp_full_df_50_7 <- left_join(sp_temp_full_df_50_6, trapping_data_weeks, 
+                               by = c("week.date" = "week.date"))
+
+sp_temp_full_df_50_8 <- left_join(sp_temp_full_df_50_7, trapping_data_months, 
+                               by = c("year" = "year", 
+                                      "month" = "month"))
+
+sp_temp_full_df_50_3 <- sp_temp_full_df_50_8 %>%
+  mutate(t_year = if_else(year == 2017, 1, NA), 
+         t_year = if_else(year == 2018, 2, t_year), 
+         t_year = if_else(year == 2019, 3, t_year), 
+         t_year = if_else(year == 2020, 4, t_year), 
+      t_season = if_else(season == "Dry Season" & year == 2017, 1, NA), 
+      t_season = if_else(season == "Rainy Season" & year == 2017, 2, t_year),
+      t_season = if_else(season == "Dry Season" & year == 2018, 3, t_year),
+      t_season = if_else(season == "Rainy Season" & year == 2018, 4, t_year),
+      t_season = if_else(season == "Dry Season" & year == 2019, 5, t_year),
+      t_season = if_else(season == "Rainy Season" & year == 2019, 6, t_year),
+      t_season = if_else(season == "Dry Season" & year == 2020, 7, t_year),
+      t_season = if_else(season == "Rainy Season" & year == 2020, 8, t_year))
+
+sp_temp_full_50 <- sp_temp_full_df_50_3
+
+saveRDS(sp_temp_full_50, "data/sp_temp_full_50.rds")
+
+```
+
+## 200m radius
+```{r - 50m radius}
+
+## Create Circles
+# circles with radius 100m
+circles_200 <- st_buffer(trapping_data_geom, dist = 200)
+circles_200_sf <- st_as_sf(circles_200)
+
+## get distinct release points
+new_release_data_2 <- st_as_sf(new_release_data, coords = c("longitude", "latitude"), crs = 4326) %>%
+  st_transform(crs = st_crs("+proj=utm +zone=23 +datum=WGS84 +units=m +no_defs")) %>%
+  filter(date_of_release <= "2020-03-31")
+
+# side data frame to get each release location 
+release_data_2 <- new_release_data_2 %>%
+  filter(type_of_release == "Adult") 
+
+new_release_data_3 <- st_as_sf(release_data_2, coords = c("longitude", "latitude"), crs = 4326) %>%
+  st_transform(crs = st_crs("+proj=utm +zone=23 +datum=WGS84 +units=m +no_defs"))
+  
+## Combine releases with trap circles
+# count # release points in each circle
+rp_200 <- st_join(circles_200_sf, release_data_2, join = st_contains) 
+rp_200_2 <- as.data.frame(rp_200) %>%
+  dplyr::select(-(geometry)) %>%
+  dplyr::select(-(type_of_release)) %>%
+  mutate(week.date = floor_date(date_of_release, unit = 'week')) %>%
+  group_by(week.date, trap_id) %>%
+  summarize(mozzies_rel = sum(average_released, na.rm = T), 
+            n_release_points = n()) %>%
+  group_by(trap_id) %>%
+  arrange(week.date) %>%
+  mutate(mozzies_rel = if_else(is.na(mozzies_rel), 0, mozzies_rel), 
+         mozzies_rel_plus1 = mozzies_rel+1,
+         mozzies_rel_lag1 = lag(mozzies_rel, 1), 
+         mozzies_rel_lag1 = if_else(is.na(mozzies_rel_lag1), 0, mozzies_rel_lag1),
+         mozzies_rel_plus1_lag1 = lag(mozzies_rel_plus1, 1),
+         mozzies_rel_lag2 = lag(mozzies_rel, 2),
+         mozzies_rel_lag2 = if_else(is.na(mozzies_rel_lag2), 0, mozzies_rel_lag2),
+         mozzies_rel_plus1_lag2 = lag(mozzies_rel_plus1, 2),
+         mozzies_rel_lag3 = lag(mozzies_rel, 3), 
+         mozzies_rel_lag3 = if_else(is.na(mozzies_rel_lag3), 0, mozzies_rel_lag3),
+         mozzies_rel_plus1_lag3 = lag(mozzies_rel_plus1, 3),
+         mozzies_rel_lag4 = lag(mozzies_rel, 4), 
+         mozzies_rel_lag4 = if_else(is.na(mozzies_rel_lag4), 0, mozzies_rel_lag4),
+         mozzies_rel_plus1_lag4 = lag(mozzies_rel_plus1, 4),
+         mozzies_rel_lag5 = lag(mozzies_rel, 5), 
+         mozzies_rel_lag5 = if_else(is.na(mozzies_rel_lag5), 0, mozzies_rel_lag5),
+         mozzies_rel_plus1_lag5 = lag(mozzies_rel_plus1, 5),
+         mozzies_rel_lag6 = lag(mozzies_rel, 6), 
+         mozzies_rel_lag6 = if_else(is.na(mozzies_rel_lag6), 0, mozzies_rel_lag6),
+         mozzies_rel_plus1_lag6 = lag(mozzies_rel_plus1, 6),
+         mozzies_rel_lag7 = lag(mozzies_rel, 7), 
+         mozzies_rel_lag7 = if_else(is.na(mozzies_rel_lag7), 0, mozzies_rel_lag7),
+         mozzies_rel_plus1_lag7 = lag(mozzies_rel_plus1, 7),
+         mozzies_rel_lag8 = lag(mozzies_rel, 8), 
+         mozzies_rel_lag8 = if_else(is.na(mozzies_rel_lag8), 0, mozzies_rel_lag8), 
+         mozzies_rel_plus1_lag8 = lag(mozzies_rel_plus1, 8)) %>%
+  ungroup() 
+
+## get first release date
+rel_first_200 <- rp_200_2 %>%
+  filter(mozzies_rel > 0) %>%
+  group_by(trap_id) %>%
+  mutate(n = row_number(), 
+         first_rel_date = if_else(n == 1, week.date, NA), 
+         full_first_rel_date = mean(first_rel_date, na.rm = T),
+         t_since_first_rel = difftime(week.date, full_first_rel_date, units = "weeks"), 
+         t_since_first_rel = as.numeric(t_since_first_rel)) %>%
+  ungroup() %>%
+  dplyr::select(week.date, trap_id, t_since_first_rel) 
+
+rp_200_3 <- left_join(rp_200_2, rel_first_200, by = c("trap_id" = "trap_id", "week.date" = "week.date"))
+
+## combine trapping and release data
+trapping_data_200_t2 <- full_join(weekly_trapping_data_sf, rp_200_3,
+                                      by = c("trap_id" = "trap_id", 
+                                             "week.date" = "week.date"))
+
+## filter out releases without trapping
+trapping_data_200_t3 <- trapping_data_200_t2 %>%
+  filter(!is.na(tot_aegypti)) %>%
+  mutate(tot_wmel = if_else(tot_aegypti == 0, 0, tot_wmel)) %>%
+    mutate(release_zone = if_else(grepl('RJ1', trap_id), "RJ1", "NA"), 
+         release_zone = if_else(grepl('RJ2', trap_id), "RJ2", release_zone), 
+         release_zone = if_else(grepl('RJ3.B1', trap_id) | 
+                                  grepl('RJ3.V1', trap_id), "RJ3.1", release_zone),
+         release_zone = if_else(grepl('RJ3.B2', trap_id) | 
+                                  grepl('RJ3.V2', trap_id), "RJ3.2", release_zone),
+         release_zone = if_else(grepl('RJ3.B3', trap_id) | 
+                                  grepl('RJ3.V3', trap_id), "RJ3.3", release_zone), 
+         release_zone = as.factor(release_zone))
+
+
+trap_model_200_df <- trapping_data_200_t3 %>%
+  mutate(trap_id = as.factor(trap_id), 
+         release_zone = as.factor(release_zone)) %>%
+  ungroup() %>%
+  arrange(week.date) %>%
+  group_by(trap_id) %>%
+  mutate(wmel_prev_lag1 = lag(trap_avg_wmel_prev, 1), 
+         wmel_prev_lag2 = lag(trap_avg_wmel_prev, 2), 
+         wmel_prev_lag3 = lag(trap_avg_wmel_prev, 3), 
+         wmel_prev_lag4 = lag(trap_avg_wmel_prev, 4),
+         wmel_prev_lag5 = lag(trap_avg_wmel_prev, 5),
+         wmel_prev_lag6 = lag(trap_avg_wmel_prev, 6),
+         wmel_prev_lag7 = lag(trap_avg_wmel_prev, 7),
+         wmel_prev_lag8 = lag(trap_avg_wmel_prev, 8), 
+         log_mozzies_rel = log(mozzies_rel), 
+         log_mozzies_rel = if_else(log_mozzies_rel == -Inf, 0, log_mozzies_rel), 
+         log_mozzies_rel_lag1 = log(mozzies_rel_lag1), 
+         log_mozzies_rel_lag1 = if_else(log_mozzies_rel_lag1 == -Inf, 0, log_mozzies_rel_lag1), 
+         log_mozzies_rel_lag2 = log(mozzies_rel_lag2), 
+         log_mozzies_rel_lag2 = if_else(log_mozzies_rel_lag2 == -Inf, 0, log_mozzies_rel_lag2),
+         log_mozzies_rel_lag3 = log(mozzies_rel_lag3), 
+         log_mozzies_rel_lag3 = if_else(log_mozzies_rel_lag3 == -Inf, 0, log_mozzies_rel_lag3), 
+         log_mozzies_rel_lag4 = log(mozzies_rel_lag4), 
+         log_mozzies_rel_lag4 = if_else(log_mozzies_rel_lag4 == -Inf, 0, log_mozzies_rel_lag4), 
+         log_mozzies_rel_lag5 = log(mozzies_rel_lag5), 
+         log_mozzies_rel_lag5 = if_else(log_mozzies_rel_lag5 == -Inf, 0, log_mozzies_rel_lag5), 
+         log_mozzies_rel_lag6 = log(mozzies_rel_lag6), 
+         log_mozzies_rel_lag6 = if_else(log_mozzies_rel_lag6 == -Inf, 0, log_mozzies_rel_lag6), 
+         log_mozzies_rel_lag7 = log(mozzies_rel_lag7), 
+         log_mozzies_rel_lag7 = if_else(log_mozzies_rel_lag7 == -Inf, 0, log_mozzies_rel_lag7), 
+         log_mozzies_rel_lag8 = log(mozzies_rel_lag8), 
+         log_mozzies_rel_lag8 = if_else(log_mozzies_rel_lag8 == -Inf, 0, log_mozzies_rel_lag8), 
+         log_tot_aegypti = log(tot_aegypti), 
+         log_tot_aegypti = if_else(log_tot_aegypti == -Inf, 0, log_tot_aegypti), 
+         log_tot_aegypti_lag1 = lag(log_tot_aegypti, 1),
+         log_tot_aegypti_lag2 = lag(log_tot_aegypti, 2),
+         log_tot_aegypti_lag3 = lag(log_tot_aegypti, 3),
+         log_tot_aegypti_lag4 = lag(log_tot_aegypti, 4),
+         log_tot_aegypti_lag5 = lag(log_tot_aegypti, 5),
+         log_tot_aegypti_lag6 = lag(log_tot_aegypti, 6),
+         log_tot_aegypti_lag7 = lag(log_tot_aegypti, 7),
+         log_tot_aegypti_lag8 = lag(log_tot_aegypti, 8)) %>%
+  ungroup() 
+
+## covariates
+pop <- covariate_gbmt %>%
+  dplyr::select(trap_id, pop_sum)
+
+elv_circles_200 <- exact_extract(elevation, circles_200_sf, fun = "mean", append_cols = "trap_id", progress = FALSE) |> 
+   rename(elev = mean)
+ 
+ugs_circles_200 <- exact_extract(ugs, circles_200_sf, fun = "sum", append_cols = "trap_id", progress = FALSE) |>
+   mutate(ugs_m = sum*10,
+          ugs_perc = ugs_m/(pi*100^2)*100) |>
+   dplyr::select(-sum)
+
+imperv_perc <- terra::classify(imperv, rbind(c(200, NA), c(255, NA)))
+ 
+imperv_circles_200 <- exact_extract(imperv_perc, circles_200_sf, fun = "mean", append_cols = "trap_id", progress = FALSE) |> 
+   rename(imperv_perc = mean)
+
+lst_circles_200 <- exact_extract(lst, circles_200_sf, fun = "mean", append_cols = "trap_id", progress = FALSE) |> 
+   rename(lst = mean)
+
+census2_200 <- st_join(circles_200_sf, census, join = st_intersects)
+ 
+census3_200 <- census2_200 |>
+   st_drop_geometry() |>
+   group_by(trap_id) |>
+   summarise(prop_minwage = mean(prop_minwage, na.rm = TRUE),
+             mean_income = mean(mean_income, na.rm = TRUE),
+             prop_hhminwage = mean(prop_hhminwage, na.rm = TRUE),
+             hhmean_income = mean(hhmean_income, na.rm = TRUE))
+
+trap_model_200_df_2 <- trap_model_200_df  |> 
+   left_join(pop, by = "trap_id") |>
+   left_join(elv_circles_50, by = "trap_id") |>
+   left_join(ugs_circles_50, by = "trap_id") |>
+   left_join(imperv_circles_50, by = "trap_id") |>
+   left_join(lst_circles_50, by = "trap_id") |>
+   left_join(census3_50, by = "trap_id")
+
+## Weather Covariates 
+meteo_week_3 <- meteo_week_2 %>%
+  group_by(year, week) %>%
+  summarize(wk_avg_tmax = mean(tmax, na.rm = T),
+            wk_avg_tmin = mean(tmin, na.rm = T),
+            wk_avg_tmean = mean(tmean, na.rm = T),
+            wk_avg_precipmean = mean(precipmean, na.rm = T),
+            wk_avg_preciptotal = mean(preciptotal, na.rm = T)) %>%
+  ungroup() %>%
+  mutate(wk_avg_tmax_lag1 = lag(wk_avg_tmax, 1),
+         wk_avg_tmax_lag2 = lag(wk_avg_tmax, 2),
+         wk_avg_tmax_lag3 = lag(wk_avg_tmax, 3),
+         wk_avg_tmax_lag4 = lag(wk_avg_tmax, 4),
+         wk_avg_tmax_lag5 = lag(wk_avg_tmax, 5),
+         wk_avg_tmax_lag6 = lag(wk_avg_tmax, 6),
+         wk_avg_tmax_lag7 = lag(wk_avg_tmax, 7),
+         wk_avg_tmax_lag8 = lag(wk_avg_tmax, 8),
+         wk_avg_tmin_lag1 = lag(wk_avg_tmin, 1),
+         wk_avg_tmin_lag2 = lag(wk_avg_tmin, 2),
+         wk_avg_tmin_lag3 = lag(wk_avg_tmin, 3),
+         wk_avg_tmin_lag4 = lag(wk_avg_tmin, 4),
+         wk_avg_tmin_lag5 = lag(wk_avg_tmin, 5),
+         wk_avg_tmin_lag6 = lag(wk_avg_tmin, 6),
+         wk_avg_tmin_lag7 = lag(wk_avg_tmin, 7),
+         wk_avg_tmin_lag8 = lag(wk_avg_tmin, 8),
+         wk_avg_tmean_lag1 = lag(wk_avg_tmean, 1),
+         wk_avg_tmean_lag2 = lag(wk_avg_tmean, 2),
+         wk_avg_tmean_lag3 = lag(wk_avg_tmean, 3),
+         wk_avg_tmean_lag4 = lag(wk_avg_tmean, 4),
+         wk_avg_tmean_lag5 = lag(wk_avg_tmean, 5),
+         wk_avg_tmean_lag6 = lag(wk_avg_tmean, 6),
+         wk_avg_tmean_lag7 = lag(wk_avg_tmean, 7),
+         wk_avg_tmean_lag8 = lag(wk_avg_tmean, 8),
+         wk_avg_precipmean_lag1 = lag(wk_avg_precipmean, 1),
+         wk_avg_precipmean_lag2 = lag(wk_avg_precipmean, 2),
+         wk_avg_precipmean_lag3 = lag(wk_avg_precipmean, 3),
+         wk_avg_precipmean_lag4 = lag(wk_avg_precipmean, 4),
+         wk_avg_precipmean_lag5 = lag(wk_avg_precipmean, 5),
+         wk_avg_precipmean_lag6 = lag(wk_avg_precipmean, 6),
+         wk_avg_precipmean_lag7 = lag(wk_avg_precipmean, 7),
+         wk_avg_precipmean_lag8 = lag(wk_avg_precipmean, 8),
+         wk_avg_preciptotal_lag1 = lag(wk_avg_preciptotal, 1),
+         wk_avg_preciptotal_lag2 = lag(wk_avg_preciptotal, 2),
+         wk_avg_preciptotal_lag3 = lag(wk_avg_preciptotal, 3),
+         wk_avg_preciptotal_lag4 = lag(wk_avg_preciptotal, 4),
+         wk_avg_preciptotal_lag5 = lag(wk_avg_preciptotal, 5),
+         wk_avg_preciptotal_lag6 = lag(wk_avg_preciptotal, 6),
+         wk_avg_preciptotal_lag7 = lag(wk_avg_preciptotal, 7),
+         wk_avg_preciptotal_lag8 = lag(wk_avg_preciptotal, 8))
+
+## Month and Season of First Release Covariates
+sp_temp_full_df_200 <- trap_model_200_df_2 %>%
+  mutate(epiyear = epiyear(week.date), 
+         epiweek = epiweek(week.date)) %>%
+  left_join(meteo_week_3, by = c("epiyear" = "year", 
+                                  "epiweek" = "week")) |>
+  arrange(week.date) %>%
+  mutate(month = month(week.date),
+    season = if_else(month >= 5 & month <= 10, 
+                            "Dry Season", "Rainy Season"))
+
+
+## trapping data
+trapping_data_lag0 <- new_trapping_data %>%
+  filter(type == "BG") %>%
+  filter(successful == TRUE) %>%
+  filter(collected_at <= "2020-03-31") %>%
+  filter(screening_total_aeg > 0) %>%
+  mutate(area = substr(trap_id, 1, 3)) %>%
+  filter(area != "TUB") %>%
+  mutate(collected_at = as.Date(collected_at, format = "%Y/%m/%d"),
+         total_aegypti_caught = as.numeric(total_aegypti_caught), 
+         screening_total_aeg = as.numeric(screening_total_aeg), 
+         screening_wmel_aeg = as.numeric(screening_wmel_aeg), 
+         trap_wmel_prev = screening_wmel_aeg/screening_total_aeg, 
+         extrap_wmel = floor(trap_wmel_prev*total_aegypti_caught), 
+         week = week(collected_at), 
+         year = year(collected_at), 
+         week.date = floor_date(collected_at, unit = 'week')) %>%
+  ungroup() %>%
+  group_by(trap_id, week.date) %>%
+  mutate(trapping_events = n()) %>%
+  mutate(tot_aegypti = sum(total_aegypti_caught, na.rm = T), 
+            tot_aeg_screened = sum(screening_total_aeg, na.rm = T), 
+            tot_wmel_screened = sum(screening_wmel_aeg, na.rm = T), 
+            trap_avg_wmel_prev = mean(trap_wmel_prev, na.rm = T), 
+            trap_events = mean(trapping_events, na.rm = T), 
+            tot_wmel = sum(extrap_wmel, na.rm = T), 
+            reporting_area, 
+            latitude, 
+            longitude) %>%
+  mutate(norm_tot_aegypti = tot_aegypti/trap_events) %>%
+  ungroup() %>%
+    mutate(year = year(week.date), 
+           week = week(week.date)) %>%
+  distinct(trap_id, collected_at, .keep_all = T)
+
+trapping_data_lag0_sf <- st_as_sf(trapping_data_lag0, coords = c("longitude", "latitude"), crs = 4326) %>%
+  st_transform(crs = st_crs("+proj=utm +zone=23 +datum=WGS84 +units=m +no_defs")) 
+
+trapping_data_geom_lag0 <- trapping_data_lag0_sf %>%
+  dplyr::select(trap_id, geometry) %>%
+  distinct(trap_id, .keep_all = T)
+
+circles_lag0_200 <- st_buffer(trapping_data_geom_lag0, dist = 200)
+circles_sf_lag0_200 <- st_as_sf(circles_lag0_200)
+
+
+## lag 0
+## Combine releases with trap circles
+# count # release points in each circle
+rp_lag0_200 <- st_join(circles_sf_lag0_200, release_data_2, join = st_contains) 
+rp_2_lag0_200 <- as.data.frame(rp_lag0_200) %>%
+  group_by(date_of_release, trap_id) %>%
+  summarize(mozzies_rel_lag0.1 = sum(average_released, na.rm = T), 
+            n_release_points = n()) %>%
+  group_by(trap_id) %>%
+  arrange(date_of_release) %>%
+  mutate(mozzies_rel_lag0.1 = if_else(is.na(mozzies_rel_lag0.1), 0, mozzies_rel_lag0.1)) %>%
+  ungroup() %>%
+  mutate(week.date = floor_date(date_of_release, unit = 'week')) 
+
+## combine trapping and release data
+trapping_data_t2_lag0_200 <- full_join(trapping_data_lag0_sf, rp_2_lag0_200,
+                                      by = c("trap_id" = "trap_id", 
+                                             "week.date" = "week.date"))
+
+## filter out releases without trapping
+trapping_data_t3_lag0_200 <- trapping_data_t2_lag0_200 %>%
+  filter(!is.na(tot_aegypti)) %>%
+  mutate(tot_wmel = if_else(tot_aegypti == 0, 0, tot_wmel)) %>%
+    mutate(release_zone = if_else(grepl('RJ1', trap_id), "RJ1", "NA"), 
+         release_zone = if_else(grepl('RJ2', trap_id), "RJ2", release_zone), 
+         release_zone = if_else(grepl('RJ3.B1', trap_id) | 
+                                  grepl('RJ3.V1', trap_id), "RJ3.1", release_zone),
+         release_zone = if_else(grepl('RJ3.B2', trap_id) | 
+                                  grepl('RJ3.V2', trap_id), "RJ3.2", release_zone),
+         release_zone = if_else(grepl('RJ3.B3', trap_id) | 
+                                  grepl('RJ3.V3', trap_id), "RJ3.3", release_zone), 
+         release_zone = as.factor(release_zone))
+
+trapping_data_t4_lag0_200 <- as.data.frame(trapping_data_t3_lag0_200) %>%
+  mutate(mozzies_rel_lag0 = if_else(date_of_release <= collected_at, mozzies_rel_lag0.1, 0)) %>%
+  group_by(trap_id, week.date) %>%
+  summarize(mozzies_rel_lag0 = sum(mozzies_rel_lag0, na.rm = T)) %>%
+  ungroup()
+
+mozzies_rel_lag0_df_200 <- trapping_data_t4_lag0_200 %>%
+  mutate(mozzies_rel_lag0_nz = if_else(mozzies_rel_lag0 == 0, NA_real_, mozzies_rel_lag0), 
+         mozzies_rel_lag0_binary = if_else(mozzies_rel_lag0 == 0, 0, 1))
+
+
+## Binary
+sp_temp_full_df_200_2 <- sp_temp_full_df_200 %>%
+  group_by(trap_id) %>%
+  arrange(week.date) %>%
+   mutate(binary_mozzies_rel = if_else(mozzies_rel > 0, 1, 0), 
+          binary_mozzies_rel = if_else(is.na(mozzies_rel), 0,
+                                       binary_mozzies_rel), 
+          binary_mozzies_rel_lag1 = if_else(mozzies_rel_lag1 > 0, 1, 0),
+          binary_mozzies_rel_lag1 = if_else(is.na(mozzies_rel_lag1), 0,
+                                       binary_mozzies_rel_lag1), 
+          binary_mozzies_rel_lag2 = if_else(mozzies_rel_lag2 > 0, 1, 0),
+          binary_mozzies_rel_lag2 = if_else(is.na(mozzies_rel_lag2), 0,
+                                       binary_mozzies_rel_lag2), 
+          binary_mozzies_rel_lag3 = if_else(mozzies_rel_lag3 > 0, 1, 0),
+          binary_mozzies_rel_lag3 = if_else(is.na(mozzies_rel_lag3), 0,
+                                       binary_mozzies_rel_lag3), 
+          binary_mozzies_rel_lag4 = if_else(mozzies_rel_lag4 > 0, 1, 0),
+          binary_mozzies_rel_lag4 = if_else(is.na(mozzies_rel_lag4), 0,
+                                       binary_mozzies_rel_lag4), 
+          binary_mozzies_rel_lag5 = if_else(mozzies_rel_lag5 > 0, 1, 0),
+          binary_mozzies_rel_lag5 = if_else(is.na(mozzies_rel_lag5), 0,
+                                       binary_mozzies_rel_lag5), 
+          binary_mozzies_rel_lag6 = if_else(mozzies_rel_lag6 > 0, 1, 0),
+          binary_mozzies_rel_lag6 = if_else(is.na(mozzies_rel_lag6), 0,
+                                       binary_mozzies_rel_lag6), 
+          binary_mozzies_rel_lag7 = if_else(mozzies_rel_lag7 > 0, 1, 0),
+          binary_mozzies_rel_lag7 = if_else(is.na(mozzies_rel_lag7), 0,
+                                       binary_mozzies_rel_lag7), 
+          binary_mozzies_rel_lag8 = if_else(mozzies_rel_lag8 > 0, 1, 0),
+          binary_mozzies_rel_lag8 = if_else(is.na(mozzies_rel_lag8), 0,
+                                       binary_mozzies_rel_lag8), 
+          log_mozzies_rel_nz = if_else(log_mozzies_rel == 0, NA_real_,
+                                       log_mozzies_rel), 
+          log_mozzies_rel_lag1_nz = if_else(log_mozzies_rel_lag1 == 0, NA_real_,
+                                       log_mozzies_rel_lag1),
+          log_mozzies_rel_lag2_nz = if_else(log_mozzies_rel_lag2 == 0, NA_real_,
+                                       log_mozzies_rel_lag2),
+          log_mozzies_rel_lag3_nz = if_else(log_mozzies_rel_lag3 == 0, NA_real_,
+                                       log_mozzies_rel_lag3),
+          log_mozzies_rel_lag4_nz = if_else(log_mozzies_rel_lag4 == 0, NA_real_,
+                                       log_mozzies_rel_lag4),
+          log_mozzies_rel_lag5_nz = if_else(log_mozzies_rel_lag5 == 0, NA_real_,
+                                       log_mozzies_rel_lag5),
+          log_mozzies_rel_lag6_nz = if_else(log_mozzies_rel_lag6 == 0, NA_real_,
+                                       log_mozzies_rel_lag6),
+          log_mozzies_rel_lag7_nz = if_else(log_mozzies_rel_lag7 == 0, NA_real_,
+                                       log_mozzies_rel_lag7),
+          log_mozzies_rel_lag8_nz = if_else(log_mozzies_rel_lag8 == 0, NA_real_,
+                                       log_mozzies_rel_lag8)) %>%
+  ungroup()
+
+
+## get x and y coordinates
+sp_temp_full_df_200_2$x <- st_coordinates(sp_temp_full_df_200_2$geometry)[,1]
+sp_temp_full_df_200_2$y <- st_coordinates(sp_temp_full_df_200_2$geometry)[,2]
+
+sp_temp_full_df_200_3 <- as.data.frame(sp_temp_full_df_200_2) %>%
+  dplyr::select(-(geometry))
+
+## set non-linear terms
+sp_temp_full_df_200_3$log_tot_aegypti_lag1_bin <- 
+  inla.group(sp_temp_full_df_200_3$log_tot_aegypti_lag1, n = 5, method = "quantile")
+sp_temp_full_df_200_3$log_tot_aegypti_lag2_bin <- 
+  inla.group(sp_temp_full_df_200_3$log_tot_aegypti_lag2, n = 5, method = "quantile")
+
+## set season and month as factors
+sp_temp_full_df_200_3 <- sp_temp_full_df_200_3 %>%
+  mutate(season = as.factor(season), 
+         month = as.factor(month))
+
+sp_temp_full_df_200_4 <- left_join(sp_temp_full_df_200_3,
+                                   mozzies_rel_lag0_df_200, 
+                               by = c("trap_id" = "trap_id", 
+                                      "week.date" = "week.date"))
+
+sp_temp_full_df_200_5 <- sp_temp_full_df_200_4 %>%
+  mutate(log_mozzies_rel_lag0 = log(mozzies_rel_lag0), 
+         log_mozzies_rel_lag0 = if_else(log_mozzies_rel_lag0 == -Inf, 0, log_mozzies_rel_lag0), 
+         log_mozzies_rel_lag0_nz = log(mozzies_rel_lag0_nz), 
+         log_mozzies_rel_lag0_nz = if_else(log_mozzies_rel_lag0_nz == -Inf, NA_real_,
+                                           log_mozzies_rel_lag0_nz))
+
+## Add MRR and AR1 terms
+mrr_abun_2 <- mrr_abun %>%
+  dplyr::select(trap_id, total_aegypti_caught, ff, lpi)
+
+mrr_abun_2 <- mrr_abun_2 %>%
+  rename(trap_abun = total_aegypti_caught)
+
+sp_temp_full_df_200_6 <- left_join(sp_temp_full_df_200_5, mrr_abun_2, 
+                               by = c("trap_id" = "trap_id"))
+
+## get t_week
+trapping_data_weeks <- trapping_data_2 %>%
+  dplyr::select(week.date) %>%
+  distinct(week.date) %>%
+  arrange(week.date) %>%
+  mutate(t_week = row_number())
+
+trapping_data_months <- trapping_data_2 %>%
+  mutate(month = month(week.date)) %>%
+  dplyr::select(month, year, week.date) %>%
+  distinct(month, year, .keep_all = T) %>%
+  arrange(year, month) %>%
+  mutate(t_month = row_number()) %>%
+  dplyr::select(year, month, t_month) %>%
+  mutate(month = as.factor(month))
+
+sp_temp_full_df_200_7 <- left_join(sp_temp_full_df_200_6, trapping_data_weeks, 
+                               by = c("week.date" = "week.date"))
+
+sp_temp_full_df_200_8 <- left_join(sp_temp_full_df_200_7, 
+                                   trapping_data_months, 
+                               by = c("year" = "year", 
+                                      "month" = "month"))
+
+sp_temp_full_df_200_3 <- sp_temp_full_df_200_8 %>%
+  mutate(t_year = if_else(year == 2017, 1, NA), 
+         t_year = if_else(year == 2018, 2, t_year), 
+         t_year = if_else(year == 2019, 3, t_year), 
+         t_year = if_else(year == 2020, 4, t_year), 
+      t_season = if_else(season == "Dry Season" & year == 2017, 1, NA), 
+      t_season = if_else(season == "Rainy Season" & year == 2017, 2, t_year),
+      t_season = if_else(season == "Dry Season" & year == 2018, 3, t_year),
+      t_season = if_else(season == "Rainy Season" & year == 2018, 4, t_year),
+      t_season = if_else(season == "Dry Season" & year == 2019, 5, t_year),
+      t_season = if_else(season == "Rainy Season" & year == 2019, 6, t_year),
+      t_season = if_else(season == "Dry Season" & year == 2020, 7, t_year),
+      t_season = if_else(season == "Rainy Season" & year == 2020, 8, t_year))
+
+sp_temp_full_200 <- sp_temp_full_df_200_3
+
+saveRDS(sp_temp_full_200, "data/sp_temp_full_200.rds")
+
+```
+
+## Vehicle Release Only
+```{r - vehicle releases}
+
+trapping_data_2 <- new_trapping_data %>%
+  filter(type == "BG") %>%
+  filter(successful == TRUE) %>%
+  filter(collected_at <= "2020-03-31") %>%
+  filter(screening_total_aeg > 0) %>%
+  mutate(area = substr(trap_id, 1, 3)) %>%
+  filter(area != "TUB") %>%
+  mutate(collected_at = as.Date(collected_at, format = "%Y/%m/%d"),
+         total_aegypti_caught = as.numeric(total_aegypti_caught), 
+         screening_total_aeg = as.numeric(screening_total_aeg), 
+         screening_wmel_aeg = as.numeric(screening_wmel_aeg), 
+         trap_wmel_prev = screening_wmel_aeg/screening_total_aeg, 
+         extrap_wmel = floor(trap_wmel_prev*total_aegypti_caught), 
+         week = week(collected_at), 
+         year = year(collected_at), 
+         week.date = floor_date(collected_at, unit = 'week')) %>%
+  ungroup() %>%
+  group_by(trap_id, week.date) %>%
+  mutate(trapping_events = n()) %>%
+  summarize(tot_aegypti = sum(total_aegypti_caught, na.rm = T), 
+            tot_aeg_screened = sum(screening_total_aeg, na.rm = T), 
+            tot_wmel_screened = sum(screening_wmel_aeg, na.rm = T), 
+            trap_avg_wmel_prev = mean(trap_wmel_prev, na.rm = T), 
+            trap_events = mean(trapping_events, na.rm = T), 
+            tot_wmel = sum(extrap_wmel, na.rm = T), 
+            reporting_area, 
+            latitude, 
+            longitude) %>%
+  mutate(norm_tot_aegypti = tot_aegypti/trap_events) %>%
+  ungroup() %>%
+    mutate(year = year(week.date), 
+           week = week(week.date)) %>%
+  distinct(trap_id, week.date, .keep_all = T)
+
+
+weekly_trapping_data_sf <- st_as_sf(trapping_data_2, coords = c("longitude", "latitude"), crs = 4326) %>%
+  st_transform(crs = st_crs("+proj=utm +zone=23 +datum=WGS84 +units=m +no_defs")) 
+
+trapping_data_geom <- weekly_trapping_data_sf %>%
+  dplyr::select(trap_id, geometry) %>%
+  distinct(trap_id, .keep_all = T)
+
+## Create Circles
+# circles with radius 100m
+circles <- st_buffer(trapping_data_geom, dist = 100)
+circles_sf <- st_as_sf(circles)
+
+## get distinct release points
+new_release_data_2 <- st_as_sf(new_release_data, coords = c("longitude", "latitude"), crs = 4326) %>%
+  st_transform(crs = st_crs("+proj=utm +zone=23 +datum=WGS84 +units=m +no_defs")) %>%
+  filter(date_of_release <= "2020-03-31")
+
+# side data frame to get each release location 
+release_data_v <- new_release_data_2 %>%
+  filter(type_of_release == "Adult") %>%
+  mutate(release_t = if_else(grepl('RJ1.V1', identifier), "vehicle", "backpack"), 
+         release_t = if_else(grepl('RJ2.V1', identifier), "vehicle", release_t), 
+         release_t = if_else(grepl('RJ3.V1', identifier), "vehicle", release_t),
+         release_t = if_else(grepl('RJ3.V2', identifier), "vehicle", release_t),
+         release_t = if_else(grepl('RJ3.V3', identifier), "vehicle", release_t), 
+         release_t = as.factor(release_t)) %>%
+  filter(release_t == "vehicle")
+
+new_release_data_3v <- st_as_sf(release_data_v, coords = c("longitude", "latitude"), crs = 4326) %>%
+  st_transform(crs = st_crs("+proj=utm +zone=23 +datum=WGS84 +units=m +no_defs"))
+  
+## Combine releases with trap circles
+# count # release points in each circle
+rp_v <- st_join(circles_sf, release_data_v, join = st_contains) 
+rp_2v <- as.data.frame(rp_v) %>%
+  dplyr::select(-(geometry)) %>%
+  dplyr::select(-(type_of_release)) %>%
+  mutate(week.date = floor_date(date_of_release, unit = 'week')) %>%
+  group_by(week.date, trap_id) %>%
+  summarize(mozzies_rel = sum(average_released, na.rm = T), 
+            n_release_points = n()) %>%
+  group_by(trap_id) %>%
+  arrange(week.date) %>%
+  mutate(mozzies_rel = if_else(is.na(mozzies_rel), 0, mozzies_rel), 
+         mozzies_rel_plus1 = mozzies_rel+1,
+         mozzies_rel_lag1 = lag(mozzies_rel, 1), 
+         mozzies_rel_lag1 = if_else(is.na(mozzies_rel_lag1), 0, mozzies_rel_lag1),
+         mozzies_rel_plus1_lag1 = lag(mozzies_rel_plus1, 1),
+         mozzies_rel_lag2 = lag(mozzies_rel, 2),
+         mozzies_rel_lag2 = if_else(is.na(mozzies_rel_lag2), 0, mozzies_rel_lag2),
+         mozzies_rel_plus1_lag2 = lag(mozzies_rel_plus1, 2),
+         mozzies_rel_lag3 = lag(mozzies_rel, 3), 
+         mozzies_rel_lag3 = if_else(is.na(mozzies_rel_lag3), 0, mozzies_rel_lag3),
+         mozzies_rel_plus1_lag3 = lag(mozzies_rel_plus1, 3),
+         mozzies_rel_lag4 = lag(mozzies_rel, 4), 
+         mozzies_rel_lag4 = if_else(is.na(mozzies_rel_lag4), 0, mozzies_rel_lag4),
+         mozzies_rel_plus1_lag4 = lag(mozzies_rel_plus1, 4),
+         mozzies_rel_lag5 = lag(mozzies_rel, 5), 
+         mozzies_rel_lag5 = if_else(is.na(mozzies_rel_lag5), 0, mozzies_rel_lag5),
+         mozzies_rel_plus1_lag5 = lag(mozzies_rel_plus1, 5),
+         mozzies_rel_lag6 = lag(mozzies_rel, 6), 
+         mozzies_rel_lag6 = if_else(is.na(mozzies_rel_lag6), 0, mozzies_rel_lag6),
+         mozzies_rel_plus1_lag6 = lag(mozzies_rel_plus1, 6),
+         mozzies_rel_lag7 = lag(mozzies_rel, 7), 
+         mozzies_rel_lag7 = if_else(is.na(mozzies_rel_lag7), 0, mozzies_rel_lag7),
+         mozzies_rel_plus1_lag7 = lag(mozzies_rel_plus1, 7),
+         mozzies_rel_lag8 = lag(mozzies_rel, 8), 
+         mozzies_rel_lag8 = if_else(is.na(mozzies_rel_lag8), 0, mozzies_rel_lag8), 
+         mozzies_rel_plus1_lag8 = lag(mozzies_rel_plus1, 8)) %>%
+  ungroup() %>%
+  mutate(release_t = "vehicle")
+
+## get first release date
+rel_first_v <- rp_2v %>%
+  filter(mozzies_rel > 0) %>%
+  group_by(trap_id) %>%
+  mutate(n = row_number(), 
+         first_rel_date = if_else(n == 1, week.date, NA), 
+         full_first_rel_date = mean(first_rel_date, na.rm = T),
+         t_since_first_rel = difftime(week.date, full_first_rel_date, units = "weeks"), 
+         t_since_first_rel = as.numeric(t_since_first_rel)) %>%
+  ungroup() %>%
+  dplyr::select(week.date, trap_id, t_since_first_rel) 
+
+rp_3v <- left_join(rp_2v, rel_first_v, by = c("trap_id" = "trap_id", "week.date" = "week.date"))
+
+## combine trapping and release data
+trapping_data_t2v <- full_join(weekly_trapping_data_sf, rp_3v,
+                                      by = c("trap_id" = "trap_id", 
+                                             "week.date" = "week.date"))
+
+## filter out releases without trapping
+trapping_data_t3_v <- trapping_data_t2v %>%
+  filter(release_t == "vehicle") %>%
+  filter(!is.na(tot_aegypti)) %>%
+  mutate(tot_wmel = if_else(tot_aegypti == 0, 0, tot_wmel)) %>%
+    mutate(release_zone = if_else(grepl('RJ1', trap_id), "RJ1", "NA"), 
+         release_zone = if_else(grepl('RJ2', trap_id), "RJ2", release_zone), 
+         release_zone = if_else(grepl('RJ3.B1', trap_id) | 
+                                  grepl('RJ3.V1', trap_id), "RJ3.1", release_zone),
+         release_zone = if_else(grepl('RJ3.B2', trap_id) | 
+                                  grepl('RJ3.V2', trap_id), "RJ3.2", release_zone),
+         release_zone = if_else(grepl('RJ3.B3', trap_id) | 
+                                  grepl('RJ3.V3', trap_id), "RJ3.3", release_zone), 
+         release_zone = as.factor(release_zone))
+
+
+trap_model_df_v <- trapping_data_t3_v %>%
+  mutate(trap_id = as.factor(trap_id), 
+         release_zone = as.factor(release_zone)) %>%
+  ungroup() %>%
+  arrange(week.date) %>%
+  group_by(trap_id) %>%
+  mutate(wmel_prev_lag1 = lag(trap_avg_wmel_prev, 1), 
+         wmel_prev_lag2 = lag(trap_avg_wmel_prev, 2), 
+         wmel_prev_lag3 = lag(trap_avg_wmel_prev, 3), 
+         wmel_prev_lag4 = lag(trap_avg_wmel_prev, 4),
+         wmel_prev_lag5 = lag(trap_avg_wmel_prev, 5),
+         wmel_prev_lag6 = lag(trap_avg_wmel_prev, 6),
+         wmel_prev_lag7 = lag(trap_avg_wmel_prev, 7),
+         wmel_prev_lag8 = lag(trap_avg_wmel_prev, 8), 
+         log_mozzies_rel = log(mozzies_rel), 
+         log_mozzies_rel = if_else(log_mozzies_rel == -Inf, 0, log_mozzies_rel), 
+         log_mozzies_rel_lag1 = log(mozzies_rel_lag1), 
+         log_mozzies_rel_lag1 = if_else(log_mozzies_rel_lag1 == -Inf, 0, log_mozzies_rel_lag1), 
+         log_mozzies_rel_lag2 = log(mozzies_rel_lag2), 
+         log_mozzies_rel_lag2 = if_else(log_mozzies_rel_lag2 == -Inf, 0, log_mozzies_rel_lag2),
+         log_mozzies_rel_lag3 = log(mozzies_rel_lag3), 
+         log_mozzies_rel_lag3 = if_else(log_mozzies_rel_lag3 == -Inf, 0, log_mozzies_rel_lag3), 
+         log_mozzies_rel_lag4 = log(mozzies_rel_lag4), 
+         log_mozzies_rel_lag4 = if_else(log_mozzies_rel_lag4 == -Inf, 0, log_mozzies_rel_lag4), 
+         log_mozzies_rel_lag5 = log(mozzies_rel_lag5), 
+         log_mozzies_rel_lag5 = if_else(log_mozzies_rel_lag5 == -Inf, 0, log_mozzies_rel_lag5), 
+         log_mozzies_rel_lag6 = log(mozzies_rel_lag6), 
+         log_mozzies_rel_lag6 = if_else(log_mozzies_rel_lag6 == -Inf, 0, log_mozzies_rel_lag6), 
+         log_mozzies_rel_lag7 = log(mozzies_rel_lag7), 
+         log_mozzies_rel_lag7 = if_else(log_mozzies_rel_lag7 == -Inf, 0, log_mozzies_rel_lag7), 
+         log_mozzies_rel_lag8 = log(mozzies_rel_lag8), 
+         log_mozzies_rel_lag8 = if_else(log_mozzies_rel_lag8 == -Inf, 0, log_mozzies_rel_lag8), 
+         log_tot_aegypti = log(tot_aegypti), 
+         log_tot_aegypti = if_else(log_tot_aegypti == -Inf, 0, log_tot_aegypti), 
+         log_tot_aegypti_lag1 = lag(log_tot_aegypti, 1),
+         log_tot_aegypti_lag2 = lag(log_tot_aegypti, 2),
+         log_tot_aegypti_lag3 = lag(log_tot_aegypti, 3),
+         log_tot_aegypti_lag4 = lag(log_tot_aegypti, 4),
+         log_tot_aegypti_lag5 = lag(log_tot_aegypti, 5),
+         log_tot_aegypti_lag6 = lag(log_tot_aegypti, 6),
+         log_tot_aegypti_lag7 = lag(log_tot_aegypti, 7),
+         log_tot_aegypti_lag8 = lag(log_tot_aegypti, 8)) %>%
+  ungroup() 
+
+## covariates
+pop <- covariate_gbmt %>%
+  dplyr::select(trap_id, pop_sum)
+
+elv_circles <- exact_extract(elevation, circles_sf, fun = "mean", append_cols = "trap_id", progress = FALSE) |> 
+   rename(elev = mean)
+ 
+ugs_circles <- exact_extract(ugs, circles_sf, fun = "sum", append_cols = "trap_id", progress = FALSE) |>
+   mutate(ugs_m = sum*10,
+          ugs_perc = ugs_m/(pi*100^2)*100) |>
+   dplyr::select(-sum)
+
+imperv_perc <- terra::classify(imperv, rbind(c(200, NA), c(255, NA)))
+ 
+imperv_circles <- exact_extract(imperv_perc, circles_sf, fun = "mean", append_cols = "trap_id", progress = FALSE) |> 
+   rename(imperv_perc = mean)
+
+lst_circles <- exact_extract(lst, circles_sf, fun = "mean", append_cols = "trap_id", progress = FALSE) |> 
+   rename(lst = mean)
+
+census2 <- st_join(circles_sf, census, join = st_intersects)
+ 
+census3 <- census2 |>
+   st_drop_geometry() |>
+   group_by(trap_id) |>
+   summarise(prop_minwage = mean(prop_minwage, na.rm = TRUE),
+             mean_income = mean(mean_income, na.rm = TRUE),
+             prop_hhminwage = mean(prop_hhminwage, na.rm = TRUE),
+             hhmean_income = mean(hhmean_income, na.rm = TRUE))
+
+trap_model_df_2v <- trap_model_df_v  |> 
+   left_join(pop, by = "trap_id") |>
+   left_join(elv_circles, by = "trap_id") |>
+   left_join(ugs_circles, by = "trap_id") |>
+   left_join(imperv_circles, by = "trap_id") |>
+   left_join(lst_circles, by = "trap_id") |>
+   left_join(census3, by = "trap_id")
+
+## Weather Covariates 
+meteo_week_3 <- meteo_week_2 %>%
+  group_by(year, week) %>%
+  summarize(wk_avg_tmax = mean(tmax, na.rm = T),
+            wk_avg_tmin = mean(tmin, na.rm = T),
+            wk_avg_tmean = mean(tmean, na.rm = T),
+            wk_avg_precipmean = mean(precipmean, na.rm = T),
+            wk_avg_preciptotal = mean(preciptotal, na.rm = T)) %>%
+  ungroup() %>%
+  mutate(wk_avg_tmax_lag1 = lag(wk_avg_tmax, 1),
+         wk_avg_tmax_lag2 = lag(wk_avg_tmax, 2),
+         wk_avg_tmax_lag3 = lag(wk_avg_tmax, 3),
+         wk_avg_tmax_lag4 = lag(wk_avg_tmax, 4),
+         wk_avg_tmax_lag5 = lag(wk_avg_tmax, 5),
+         wk_avg_tmax_lag6 = lag(wk_avg_tmax, 6),
+         wk_avg_tmax_lag7 = lag(wk_avg_tmax, 7),
+         wk_avg_tmax_lag8 = lag(wk_avg_tmax, 8),
+         wk_avg_tmin_lag1 = lag(wk_avg_tmin, 1),
+         wk_avg_tmin_lag2 = lag(wk_avg_tmin, 2),
+         wk_avg_tmin_lag3 = lag(wk_avg_tmin, 3),
+         wk_avg_tmin_lag4 = lag(wk_avg_tmin, 4),
+         wk_avg_tmin_lag5 = lag(wk_avg_tmin, 5),
+         wk_avg_tmin_lag6 = lag(wk_avg_tmin, 6),
+         wk_avg_tmin_lag7 = lag(wk_avg_tmin, 7),
+         wk_avg_tmin_lag8 = lag(wk_avg_tmin, 8),
+         wk_avg_tmean_lag1 = lag(wk_avg_tmean, 1),
+         wk_avg_tmean_lag2 = lag(wk_avg_tmean, 2),
+         wk_avg_tmean_lag3 = lag(wk_avg_tmean, 3),
+         wk_avg_tmean_lag4 = lag(wk_avg_tmean, 4),
+         wk_avg_tmean_lag5 = lag(wk_avg_tmean, 5),
+         wk_avg_tmean_lag6 = lag(wk_avg_tmean, 6),
+         wk_avg_tmean_lag7 = lag(wk_avg_tmean, 7),
+         wk_avg_tmean_lag8 = lag(wk_avg_tmean, 8),
+         wk_avg_precipmean_lag1 = lag(wk_avg_precipmean, 1),
+         wk_avg_precipmean_lag2 = lag(wk_avg_precipmean, 2),
+         wk_avg_precipmean_lag3 = lag(wk_avg_precipmean, 3),
+         wk_avg_precipmean_lag4 = lag(wk_avg_precipmean, 4),
+         wk_avg_precipmean_lag5 = lag(wk_avg_precipmean, 5),
+         wk_avg_precipmean_lag6 = lag(wk_avg_precipmean, 6),
+         wk_avg_precipmean_lag7 = lag(wk_avg_precipmean, 7),
+         wk_avg_precipmean_lag8 = lag(wk_avg_precipmean, 8),
+         wk_avg_preciptotal_lag1 = lag(wk_avg_preciptotal, 1),
+         wk_avg_preciptotal_lag2 = lag(wk_avg_preciptotal, 2),
+         wk_avg_preciptotal_lag3 = lag(wk_avg_preciptotal, 3),
+         wk_avg_preciptotal_lag4 = lag(wk_avg_preciptotal, 4),
+         wk_avg_preciptotal_lag5 = lag(wk_avg_preciptotal, 5),
+         wk_avg_preciptotal_lag6 = lag(wk_avg_preciptotal, 6),
+         wk_avg_preciptotal_lag7 = lag(wk_avg_preciptotal, 7),
+         wk_avg_preciptotal_lag8 = lag(wk_avg_preciptotal, 8))
+
+## Month and Season of First Release Covariates
+sp_temp_full_df_v <- trap_model_df_2v %>%
+  mutate(epiyear = epiyear(week.date), 
+         epiweek = epiweek(week.date)) %>%
+  left_join(meteo_week_3, by = c("epiyear" = "year", 
+                                  "epiweek" = "week")) |>
+  arrange(week.date) %>%
+  mutate(month = month(week.date),
+    season = if_else(month >= 5 & month <= 10, 
+                            "Dry Season", "Rainy Season"))
+
+
+## trapping data
+trapping_data_lag0 <- new_trapping_data %>%
+  filter(type == "BG") %>%
+  filter(successful == TRUE) %>%
+  filter(collected_at <= "2020-03-31") %>%
+  filter(screening_total_aeg > 0) %>%
+  mutate(area = substr(trap_id, 1, 3)) %>%
+  filter(area != "TUB") %>%
+  mutate(collected_at = as.Date(collected_at, format = "%Y/%m/%d"),
+         total_aegypti_caught = as.numeric(total_aegypti_caught), 
+         screening_total_aeg = as.numeric(screening_total_aeg), 
+         screening_wmel_aeg = as.numeric(screening_wmel_aeg), 
+         trap_wmel_prev = screening_wmel_aeg/screening_total_aeg, 
+         extrap_wmel = floor(trap_wmel_prev*total_aegypti_caught), 
+         week = week(collected_at), 
+         year = year(collected_at), 
+         week.date = floor_date(collected_at, unit = 'week')) %>%
+  ungroup() %>%
+  group_by(trap_id, week.date) %>%
+  mutate(trapping_events = n()) %>%
+  mutate(tot_aegypti = sum(total_aegypti_caught, na.rm = T), 
+            tot_aeg_screened = sum(screening_total_aeg, na.rm = T), 
+            tot_wmel_screened = sum(screening_wmel_aeg, na.rm = T), 
+            trap_avg_wmel_prev = mean(trap_wmel_prev, na.rm = T), 
+            trap_events = mean(trapping_events, na.rm = T), 
+            tot_wmel = sum(extrap_wmel, na.rm = T), 
+            reporting_area, 
+            latitude, 
+            longitude) %>%
+  mutate(norm_tot_aegypti = tot_aegypti/trap_events) %>%
+  ungroup() %>%
+    mutate(year = year(week.date), 
+           week = week(week.date)) %>%
+  distinct(trap_id, collected_at, .keep_all = T)
+
+trapping_data_lag0_sf <- st_as_sf(trapping_data_lag0, coords = c("longitude", "latitude"), crs = 4326) %>%
+  st_transform(crs = st_crs("+proj=utm +zone=23 +datum=WGS84 +units=m +no_defs")) 
+
+trapping_data_geom_lag0 <- trapping_data_lag0_sf %>%
+  dplyr::select(trap_id, geometry) %>%
+  distinct(trap_id, .keep_all = T)
+
+circles_lag0 <- st_buffer(trapping_data_geom_lag0, dist = 100)
+circles_sf_lag0 <- st_as_sf(circles_lag0)
+
+
+## lag 0
+## Combine releases with trap circles
+# count # release points in each circle
+rp_lag0 <- st_join(circles_sf_lag0, release_data_2, join = st_contains) 
+rp_2_lag0 <- as.data.frame(rp_lag0) %>%
+  group_by(date_of_release, trap_id) %>%
+  summarize(mozzies_rel_lag0.1 = sum(average_released, na.rm = T), 
+            n_release_points = n()) %>%
+  group_by(trap_id) %>%
+  arrange(date_of_release) %>%
+  mutate(mozzies_rel_lag0.1 = if_else(is.na(mozzies_rel_lag0.1), 0, mozzies_rel_lag0.1)) %>%
+  ungroup() %>%
+  mutate(week.date = floor_date(date_of_release, unit = 'week')) 
+
+## combine trapping and release data
+trapping_data_t2_lag0 <- full_join(trapping_data_lag0_sf, rp_2_lag0,
+                                      by = c("trap_id" = "trap_id", 
+                                             "week.date" = "week.date"))
+
+## filter out releases without trapping
+trapping_data_t3_lag0_v <- trapping_data_t2_lag0 %>%
+  filter(!is.na(tot_aegypti)) %>%
+  mutate(tot_wmel = if_else(tot_aegypti == 0, 0, tot_wmel)) %>%
+    mutate(release_zone = if_else(grepl('RJ1', trap_id), "RJ1", "NA"), 
+         release_zone = if_else(grepl('RJ2', trap_id), "RJ2", release_zone), 
+         release_zone = if_else(grepl('RJ3.B1', trap_id) | 
+                                  grepl('RJ3.V1', trap_id), "RJ3.1", release_zone),
+         release_zone = if_else(grepl('RJ3.B2', trap_id) | 
+                                  grepl('RJ3.V2', trap_id), "RJ3.2", release_zone),
+         release_zone = if_else(grepl('RJ3.B3', trap_id) | 
+                                  grepl('RJ3.V3', trap_id), "RJ3.3", release_zone), 
+         release_zone = as.factor(release_zone))
+
+trapping_data_t4_lag0_v <- as.data.frame(trapping_data_t3_lag0_v) %>%
+  mutate(mozzies_rel_lag0 = if_else(date_of_release <= collected_at, mozzies_rel_lag0.1, 0)) %>%
+  group_by(trap_id, week.date) %>%
+  summarize(mozzies_rel_lag0 = sum(mozzies_rel_lag0, na.rm = T)) %>%
+  ungroup()
+
+mozzies_rel_lag0_df_v <- trapping_data_t4_lag0_v %>%
+  mutate(mozzies_rel_lag0_nz = if_else(mozzies_rel_lag0 == 0, NA_real_, mozzies_rel_lag0), 
+         mozzies_rel_lag0_binary = if_else(mozzies_rel_lag0 == 0, 0, 1))
+
+
+## Binary
+sp_temp_full_df_2v <- sp_temp_full_df_v %>%
+  group_by(trap_id) %>%
+  arrange(week.date) %>%
+   mutate(binary_mozzies_rel = if_else(mozzies_rel > 0, 1, 0), 
+          binary_mozzies_rel = if_else(is.na(mozzies_rel), 0,
+                                       binary_mozzies_rel), 
+          binary_mozzies_rel_lag1 = if_else(mozzies_rel_lag1 > 0, 1, 0),
+          binary_mozzies_rel_lag1 = if_else(is.na(mozzies_rel_lag1), 0,
+                                       binary_mozzies_rel_lag1), 
+          binary_mozzies_rel_lag2 = if_else(mozzies_rel_lag2 > 0, 1, 0),
+          binary_mozzies_rel_lag2 = if_else(is.na(mozzies_rel_lag2), 0,
+                                       binary_mozzies_rel_lag2), 
+          binary_mozzies_rel_lag3 = if_else(mozzies_rel_lag3 > 0, 1, 0),
+          binary_mozzies_rel_lag3 = if_else(is.na(mozzies_rel_lag3), 0,
+                                       binary_mozzies_rel_lag3), 
+          binary_mozzies_rel_lag4 = if_else(mozzies_rel_lag4 > 0, 1, 0),
+          binary_mozzies_rel_lag4 = if_else(is.na(mozzies_rel_lag4), 0,
+                                       binary_mozzies_rel_lag4), 
+          binary_mozzies_rel_lag5 = if_else(mozzies_rel_lag5 > 0, 1, 0),
+          binary_mozzies_rel_lag5 = if_else(is.na(mozzies_rel_lag5), 0,
+                                       binary_mozzies_rel_lag5), 
+          binary_mozzies_rel_lag6 = if_else(mozzies_rel_lag6 > 0, 1, 0),
+          binary_mozzies_rel_lag6 = if_else(is.na(mozzies_rel_lag6), 0,
+                                       binary_mozzies_rel_lag6), 
+          binary_mozzies_rel_lag7 = if_else(mozzies_rel_lag7 > 0, 1, 0),
+          binary_mozzies_rel_lag7 = if_else(is.na(mozzies_rel_lag7), 0,
+                                       binary_mozzies_rel_lag7), 
+          binary_mozzies_rel_lag8 = if_else(mozzies_rel_lag8 > 0, 1, 0),
+          binary_mozzies_rel_lag8 = if_else(is.na(mozzies_rel_lag8), 0,
+                                       binary_mozzies_rel_lag8), 
+          log_mozzies_rel_nz = if_else(log_mozzies_rel == 0, NA_real_,
+                                       log_mozzies_rel), 
+          log_mozzies_rel_lag1_nz = if_else(log_mozzies_rel_lag1 == 0, NA_real_,
+                                       log_mozzies_rel_lag1),
+          log_mozzies_rel_lag2_nz = if_else(log_mozzies_rel_lag2 == 0, NA_real_,
+                                       log_mozzies_rel_lag2),
+          log_mozzies_rel_lag3_nz = if_else(log_mozzies_rel_lag3 == 0, NA_real_,
+                                       log_mozzies_rel_lag3),
+          log_mozzies_rel_lag4_nz = if_else(log_mozzies_rel_lag4 == 0, NA_real_,
+                                       log_mozzies_rel_lag4),
+          log_mozzies_rel_lag5_nz = if_else(log_mozzies_rel_lag5 == 0, NA_real_,
+                                       log_mozzies_rel_lag5),
+          log_mozzies_rel_lag6_nz = if_else(log_mozzies_rel_lag6 == 0, NA_real_,
+                                       log_mozzies_rel_lag6),
+          log_mozzies_rel_lag7_nz = if_else(log_mozzies_rel_lag7 == 0, NA_real_,
+                                       log_mozzies_rel_lag7),
+          log_mozzies_rel_lag8_nz = if_else(log_mozzies_rel_lag8 == 0, NA_real_,
+                                       log_mozzies_rel_lag8)) %>%
+  ungroup()
+
+
+## get x and y coordinates
+sp_temp_full_df_2v$x <- st_coordinates(sp_temp_full_df_2v$geometry)[,1]
+sp_temp_full_df_2v$y <- st_coordinates(sp_temp_full_df_2v$geometry)[,2]
+
+sp_temp_full_df_3v <- as.data.frame(sp_temp_full_df_2v) %>%
+  dplyr::select(-(geometry))
+
+## set non-linear terms
+sp_temp_full_df_3v$log_tot_aegypti_lag1_bin <- 
+  inla.group(sp_temp_full_df_3v$log_tot_aegypti_lag1, n = 5, method = "quantile")
+sp_temp_full_df_3v$log_tot_aegypti_lag2_bin <- 
+  inla.group(sp_temp_full_df_3v$log_tot_aegypti_lag2, n = 5, method = "quantile")
+
+## set season and month as factors
+sp_temp_full_df_3v <- sp_temp_full_df_3v %>%
+  mutate(season = as.factor(season), 
+         month = as.factor(month))
+
+sp_temp_full_df_4v <- left_join(sp_temp_full_df_3v, mozzies_rel_lag0_df_v, 
+                               by = c("trap_id" = "trap_id", 
+                                      "week.date" = "week.date"))
+
+sp_temp_full_df_5v <- sp_temp_full_df_4v %>%
+  mutate(log_mozzies_rel_lag0 = log(mozzies_rel_lag0), 
+         log_mozzies_rel_lag0 = if_else(log_mozzies_rel_lag0 == -Inf, 0, log_mozzies_rel_lag0), 
+         log_mozzies_rel_lag0_nz = log(mozzies_rel_lag0_nz), 
+         log_mozzies_rel_lag0_nz = if_else(log_mozzies_rel_lag0_nz == -Inf, NA_real_,
+                                           log_mozzies_rel_lag0_nz))
+
+## Add MRR and AR1 terms
+mrr_abun_2 <- mrr_abun %>%
+  dplyr::select(trap_id, total_aegypti_caught, ff, lpi)
+
+mrr_abun_2 <- mrr_abun_2 %>%
+  rename(trap_abun = total_aegypti_caught)
+
+sp_temp_full_df_6v <- left_join(sp_temp_full_df_5v, mrr_abun_2, 
+                               by = c("trap_id" = "trap_id"))
+
+## get t_week
+trapping_data_weeks <- trapping_data_2 %>%
+  dplyr::select(week.date) %>%
+  distinct(week.date) %>%
+  arrange(week.date) %>%
+  mutate(t_week = row_number())
+
+trapping_data_months <- trapping_data_2 %>%
+  mutate(month = month(week.date)) %>%
+  dplyr::select(month, year, week.date) %>%
+  distinct(month, year, .keep_all = T) %>%
+  arrange(year, month) %>%
+  mutate(t_month = row_number()) %>%
+  dplyr::select(year, month, t_month) %>%
+  mutate(month = as.factor(month))
+
+sp_temp_full_df_7v <- left_join(sp_temp_full_df_6v, trapping_data_weeks, 
+                               by = c("week.date" = "week.date"))
+
+sp_temp_full_df_8v <- left_join(sp_temp_full_df_7v, trapping_data_months, 
+                               by = c("year" = "year", 
+                                      "month" = "month"))
+
+sp_temp_full_df_3v <- sp_temp_full_df_8v %>%
+  mutate(t_year = if_else(year == 2017, 1, NA), 
+         t_year = if_else(year == 2018, 2, t_year), 
+         t_year = if_else(year == 2019, 3, t_year), 
+         t_year = if_else(year == 2020, 4, t_year), 
+      t_season = if_else(season == "Dry Season" & year == 2017, 1, NA), 
+      t_season = if_else(season == "Rainy Season" & year == 2017, 2, t_year),
+      t_season = if_else(season == "Dry Season" & year == 2018, 3, t_year),
+      t_season = if_else(season == "Rainy Season" & year == 2018, 4, t_year),
+      t_season = if_else(season == "Dry Season" & year == 2019, 5, t_year),
+      t_season = if_else(season == "Rainy Season" & year == 2019, 6, t_year),
+      t_season = if_else(season == "Dry Season" & year == 2020, 7, t_year),
+      t_season = if_else(season == "Rainy Season" & year == 2020, 8, t_year))
+
+sp_temp_full_v <- sp_temp_full_df_3v
+
+saveRDS(sp_temp_full_v, "data/sp_temp_full_v.rds")
+
+```
+
+
