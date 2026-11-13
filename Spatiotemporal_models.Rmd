@@ -723,12 +723,37 @@ result_sp_fig <- inla(mod_sp_fig,
 
 ```
 
+```{r}
+## Covariate median (range) on the model data
+d <- as.data.frame(sp_temp_full_df_4)
+vars <- intersect(c("tot_wmel", "tot_aegypti", "mozzies_rel_plus1_lag1", "wmel_prev_lag1",
+                    "wk_avg_tmin_lag4", "wk_avg_tmax_lag1", "wk_avg_tmean_lag1", "wk_avg_precipmean_lag1",
+                    "mean_income", "hhmean_income", "prop_minwage", "prop_halfminwage",
+                    "prop_hhminwage", "prop_hhhalfminwage", "pop_sum", "elev", "imperv_perc", "ugs_perc"),
+                  names(d))
+sapply(d[, vars], function(x) sprintf("%.1f (%.1f–%.1f)", median(x, na.rm = TRUE),
+                                      min(x, na.rm = TRUE), max(x, na.rm = TRUE)))
+mean(d$binary_mozzies_rel_lag1, na.rm = TRUE)  # proportion of trap-weeks with releases
+max(d$t_week)                                   # number of weeks
+
+## Priors actually used and hyperparameter posteriors
+inla.priors.used(result_sp_fig)
+v <- result_sp_fig$summary.hyperpar 
+
+## Matérn range and marginal SD on the natural scale
+spde_res <- inla.spde2.result(result_sp_fig, "spatial.field", spde)
+inla.zmarginal(spde_res$marginals.range.nominal[[1]])
+inla.zmarginal(inla.tmarginal(sqrt, spde_res$marginals.variance.nominal[[1]]))
+```
+
+
+
 ## Figure SP linear and nl covariates
 * get coefficient effects using the marginal posterior distribution summaries to get an interpretable effect
 * since need to exponentiate, the effect is no longer a linear transformation
 * allows you to propogate uncertainty through nonlinear relationships 
 ```{r - 4b}
-## time varyinig abundance
+## time varying abundance
 mod_linear <- result_sp_fig$summary.fixed
 
 ### binary mozzies_rel
@@ -1119,7 +1144,314 @@ pred_data_1 <- sp_temp_full_df_4  |>
 
 
 ## Supplemental Analyses
-### Try including cyclical random walk for seasonality 
+### Fig S4 - Sensitivity Analysis: Model without Ae. aegypti trap counts 
+```{r}
+mod_fig_s12 <- obs ~ -1 + Intercept + binary_mozzies_rel_lag1 + log(mozzies_rel_plus1_lag1) + wk_avg_precipmean_lag6 + f(wk_avg_tmin_lag4_bin, model = "rw2") + f(imperv_bin, model = "rw2") + f(popdens_bin, model = "rw2") + f(elev_bin, model = "rw2") + f(income_bin, model = "rw2") + f(t_week, model = "ar1") + offset(log_tot_aegypti) + f(spatial.field, model = spde)
+
+result_fig_s12 <- inla(mod_fig_s12,
+                data=inla.stack.data(stack),
+                family="nbinomial",
+                control.predictor=list(A=inla.stack.A(stack), compute = T), 
+                control.fixed=list(expand.factor.strategy='inla'),
+                control.compute=list(config = TRUE, dic = TRUE, waic = TRUE),
+                verbose=T) 
+
+### binary mozzies_rel
+bin_mozzies_rel_marg_s12 <- result_fig_s12$marginals.fixed$binary_mozzies_rel_lag1
+
+set.seed(123)
+beta_samples_1 <- inla.rmarginal(1000, bin_mozzies_rel_marg_s5)
+
+effect_samples_1 <- exp(beta_samples_1)
+
+bin_mozzies_rel_s12_df <- data.frame(
+  name = "binary_mozzies_rel_lag1",
+  ID = NA,
+  mean_effect  = mean(effect_samples_1),
+  lower_effect = quantile(effect_samples_1, 0.025),
+  upper_effect = quantile(effect_samples_1, 0.975))
+
+### "log_mozzies_rel_plus1_lag1"
+log_mozzies_rel_marg_s12 <- result_fig_s12$marginals.fixed$`log(mozzies_rel_plus1_lag1)`
+
+set.seed(123)
+beta_samples_2 <- inla.rmarginal(1000, log_mozzies_rel_marg_s5)
+
+effect_samples_2 <- exp(beta_samples_2)  
+
+log_mozzies_rel_s12_df <- data.frame(
+  name = "log_mozzies_rel_plus1_lag1",
+  ID = NA, 
+  mean_effect  = mean(effect_samples_2),
+  lower_effect = quantile(effect_samples_2, 0.025),
+  upper_effect = quantile(effect_samples_2, 0.975))
+
+### wmel_prev_lag1
+wk_avg_precipmean_lag6_marg_s12 <- result_fig_s12$marginals.fixed$wk_avg_precipmean_lag6
+
+set.seed(123)
+beta_samples_3 <- inla.rmarginal(1000, wk_avg_precipmean_lag6_marg_s5)
+
+effect_samples_3 <- exp(beta_samples_3*10)  
+
+wk_avg_precipmean_lag6_s12_df <- data.frame(
+  name = "wk_avg_precipmean_lag6",
+  ID = NA, 
+  mean_effect  = mean(effect_samples_3),
+  lower_effect = quantile(effect_samples_3, 0.025),
+  upper_effect = quantile(effect_samples_3, 0.975))
+
+
+### wk_avg_tmin_lag4_bin -- 15.9 18.5 22.3 20.6 24.0
+wk_avg_tmin_lag4_bin_marginals_s12 <- result_fig_s12$marginals.random$wk_avg_tmin_lag4_bin
+
+set.seed(123)
+wk_avg_tmin_lag4_bin_s12_df <- do.call(rbind, lapply(names(wk_avg_tmin_lag4_bin_marginals_s12), function(idx_name) {
+  
+  # Extract that bin’s marginal posterior
+  marg <- wk_avg_tmin_lag4_bin_marginals_s12[[idx_name]]
+  
+  # Sample from the posterior
+  beta_samples <- inla.rmarginal(1000, marg)
+  
+  # Exponentiate to get multiplicative effect (since it’s usually on log-link)
+  effect_samples <- exp(beta_samples)
+  
+  # Summarize posterior
+  data.frame(
+    name = "wk_avg_tmin_lag4_bin",
+    ID = idx_name,
+    mean_effect  = mean(effect_samples),
+    lower_effect = quantile(effect_samples, 0.025),
+    upper_effect = quantile(effect_samples, 0.975))}))
+
+### imperv_bin -- 72.42895 82.37428 90.84649 60.43978 37.56979
+imperv_bin_marginals_s12 <- result_fig_s12$marginals.random$imperv_bin 
+
+set.seed(123)
+imperv_bin_s12_df <- do.call(rbind, lapply(names(imperv_bin_marginals_s12), function(idx_name) {
+  
+  # Extract that bin’s marginal posterior
+  marg <- imperv_bin_marginals_s12[[idx_name]]
+  
+  # Sample from the posterior
+  beta_samples <- inla.rmarginal(1000, marg)
+  
+  # Exponentiate to get multiplicative effect (since it’s usually on log-link)
+  effect_samples <- exp(beta_samples)
+  
+  # Summarize posterior
+  data.frame(
+    name = "imperv_bin",
+    ID = idx_name,
+    mean_effect  = mean(effect_samples),
+    lower_effect = quantile(effect_samples, 0.025),
+    upper_effect = quantile(effect_samples, 0.975))}))
+
+### popdens_bin - 889.235657 508.161407 366.298981 162.876450 3.884808
+popdens_bin_marginals_s12 <- result_fig_s12$marginals.random$popdens_bin 
+
+set.seed(123)
+popdens_bin_s12_df <- do.call(rbind, lapply(names(popdens_bin_marginals_s12), function(idx_name) {
+  
+  # Extract that bin’s marginal posterior
+  marg <- popdens_bin_marginals_s12[[idx_name]]
+  
+  # Sample from the posterior
+  beta_samples <- inla.rmarginal(1000, marg)
+  
+  # Exponentiate to get multiplicative effect (since it’s usually on log-link)
+  effect_samples <- exp(beta_samples)
+  
+  # Summarize posterior
+  data.frame(
+    name = "popdens_bin",
+    ID = idx_name,
+    mean_effect  = mean(effect_samples),
+    lower_effect = quantile(effect_samples, 0.025),
+    upper_effect = quantile(effect_samples, 0.975))}))
+
+### elev_bin - 41.341003 21.842211 13.229877  6.084577  8.856280
+elev_bin_marginals_s12 <- result_fig_s12$marginals.random$elev_bin 
+
+set.seed(123)
+elev_bin_s12_df <- do.call(rbind, lapply(names(elev_bin_marginals_s12), function(idx_name) {
+  
+  # Extract that bin’s marginal posterior
+  marg <- elev_bin_marginals_s12[[idx_name]]
+  
+  # Sample from the posterior
+  beta_samples <- inla.rmarginal(1000, marg)
+  
+  # Exponentiate to get multiplicative effect (since it’s usually on log-link)
+  effect_samples <- exp(beta_samples)
+  
+  # Summarize posterior
+  data.frame(
+    name = "elev_bin",
+    ID = idx_name,
+    mean_effect  = mean(effect_samples),
+    lower_effect = quantile(effect_samples, 0.025),
+    upper_effect = quantile(effect_samples, 0.975))}))
+
+### income_bin - 965.4459  483.3841 1349.1109  738.3354 2362.8327
+income_bin_marginals_s12 <- result_fig_s12$marginals.random$income_bin 
+
+set.seed(123)
+income_bin_s12_df <- do.call(rbind, lapply(names(income_bin_marginals_s12), function(idx_name) {
+  
+  # Extract that bin’s marginal posterior
+  marg <- income_bin_marginals_s12[[idx_name]]
+  
+  # Sample from the posterior
+  beta_samples <- inla.rmarginal(1000, marg)
+  
+  # Exponentiate to get multiplicative effect (since it’s usually on log-link)
+  effect_samples <- exp(beta_samples)
+  
+  # Summarize posterior
+  data.frame(
+    name = "income_bin",
+    ID = idx_name,
+    mean_effect  = mean(effect_samples),
+    lower_effect = quantile(effect_samples, 0.025),
+    upper_effect = quantile(effect_samples, 0.975))}))
+
+
+
+
+# bin_mozzies_rel_s12_df, log_mozzies_rel_s12_df, wk_avg_precipmean_lag6_s12_df,
+#wk_avg_tmin_lag4_bin_s12_df, imperv_bin_s12_df, popdens_bin_s12_df, elev_bin_s12_df,  
+# income_bin_s12_df
+
+mod_s12_linear_nl_covariates <- rbind(bin_mozzies_rel_s12_df,
+                                   log_mozzies_rel_s12_df,
+                                  wk_avg_precipmean_lag6_s12_df, 
+                                   wk_avg_tmin_lag4_bin_s12_df,
+                                  popdens_bin_s12_df,
+                                  income_bin_s12_df,
+                                   imperv_bin_s12_df,
+                                   elev_bin_s12_df)
+
+
+new_cov_names_s12 <- c("wMel released lag 1w", 
+                   "No. wMel released lag 1w*", 
+                   "Daily precipitation lag 6w",
+                   "Weekly temperature lag 4w",
+                   "", 
+                   "",
+                   "",
+                   "",
+                   "Inhabitants",
+                   "",
+                   "",
+                   "",
+                   "",
+                   "Income", 
+                   "",
+                   "",
+                   "",
+                   "",
+                   "Impervious surface",
+                   "",
+                   "",
+                   "",
+                   "",
+                   "Elevation", 
+                   "",
+                   "",
+                   "",
+                   "")
+
+mod_s12_linear_nl_covariates$new_cov_names <- new_cov_names_s12
+
+order <- c(1:28)
+
+mod_s12_linear_nl_covariates$order <- order
+
+mod_s12_linear_nl_covariates_2 <- mod_s12_linear_nl_covariates %>%
+  mutate(new.order = if_else(order == 3, 5, order), 
+         new.order = if_else(order >= 4, order + 13, new.order)) %>%
+  dplyr::select(!(order)) %>%
+  dplyr::select(!(new_cov_names))
+
+mod_s12_linear_nl_covariates_2[29,]$new.order <- 3
+mod_s12_linear_nl_covariates_2[30,]$new.order <- 4
+mod_s12_linear_nl_covariates_2[31,]$new.order <- 6
+mod_s12_linear_nl_covariates_2[32,]$new.order <- 7
+mod_s12_linear_nl_covariates_2[33,]$new.order <- 8
+mod_s12_linear_nl_covariates_2[34,]$new.order <- 9
+mod_s12_linear_nl_covariates_2[35,]$new.order <- 10
+mod_s12_linear_nl_covariates_2[36,]$new.order <- 11
+mod_s12_linear_nl_covariates_2[37,]$new.order <- 12
+mod_s12_linear_nl_covariates_2[38,]$new.order <- 13
+mod_s12_linear_nl_covariates_2[39,]$new.order <- 14
+mod_s12_linear_nl_covariates_2[40,]$new.order <- 15
+mod_s12_linear_nl_covariates_2[41,]$new.order <- 16
+
+main_mod_covs <- mod_linear_nl_covariates_4 %>%
+  dplyr::select(new_cov_names, order.new, mean_effect, lower_effect, upper_effect, bin) %>%
+  rename(old_mod_effect = mean_effect) %>%
+  rename(old_mod_lw = lower_effect) %>%
+  rename(old_mod_up = upper_effect) %>%
+  mutate(new.order = if_else(order.new >= 5, order.new + 1, order.new)) %>%
+  dplyr::select(!(order.new))
+
+main_mod_covs[41,]$new.order <- 5
+main_mod_covs[41,]$new_cov_names <- "Daily precipitation lag 6w"
+main_mod_covs[41,]$bin <- "cm"
+
+mod_sp_comb <- left_join(main_mod_covs, mod_s12_linear_nl_covariates_2, 
+                         by = c("new.order" = "new.order")) 
+
+mod_sp_comb_2 <- mod_sp_comb %>%
+  arrange(new.order)
+
+## Forest Plot
+mod_sp_comb_2 %>%
+ggplot(aes(y = rev(new.order))) +
+  geom_errorbarh(aes(x = old_mod_effect, xmin = old_mod_lw, xmax = old_mod_up),  height = 0.2, 
+                 color = "black", size = 1, alpha = 0.7) + 
+  geom_point(aes(x = old_mod_effect), size = 2, shape = 15, color = "black", alpha = 0.7) +
+  geom_errorbarh(aes(x = mean_effect, xmin = lower_effect, xmax = upper_effect), height = 0.2, 
+                 color = "steelblue", size = 1, alpha = 0.8) +
+  geom_point(aes(x = mean_effect), size = 2, shape = 15, color = "steelblue") +
+  geom_vline(xintercept=1, lty=2, color = "red", size = 1) +
+  theme_classic() +
+  xlab("Effect Estimate (95% CI)") +
+  ylab("") +
+  theme(axis.ticks.y= element_blank(), 
+        axis.text.y = element_text(size = 10, margin = margin(r = 5, t =10, b = 10)), 
+        axis.line.y = element_blank(),
+        axis.text.x = element_text(size = 9), 
+        axis.title.y = element_text(size = 18),
+        axis.title.x = element_text(size = 11),
+        plot.margin = margin(t = 10, r = 10, b = 10, l = 20), 
+        text = element_text(family = "Helvetica")) +  
+  scale_y_discrete(labels = function(y) str_wrap(y, width = 500))+
+  scale_x_continuous(breaks = seq(0.5, 1.75, by = 0.25))+
+  geom_text(aes(x = 0.4, label = new_cov_names, fontface = "bold"), hjust = 1, size = 3.5)+
+  geom_text(aes(x = 2, label = bin), hjust = 0, size = 3.5)+
+  coord_cartesian(xlim = c(-0.35, 2.3))+
+  geom_hline(yintercept = seq(2.5, 40.5, by = 1), color = "lightgrey", alpha = 0.7)+
+  geom_hline(yintercept = 5.5, color = "black", alpha = 0.6)+
+  geom_hline(yintercept = 10.5, color = "black", alpha = 0.6)+
+  geom_hline(yintercept = 15.5, color = "black", alpha = 0.6)+
+  geom_hline(yintercept = 20.5, color = "black", alpha = 0.6)+
+  geom_hline(yintercept = 25.5, color = "black", alpha = 0.6)+
+  geom_hline(yintercept = 30.5, color = "black", alpha = 0.6)+
+  geom_hline(yintercept = 40.5, color = "black", alpha = 0.6)+
+  geom_hline(yintercept = 39.5, color = "black", alpha = 0.6)+
+  geom_hline(yintercept = 37.5, color = "black", alpha = 0.6)+
+  #geom_hline(yintercept = 41.5, color = "black", alpha = 0.6)+
+  geom_hline(yintercept = 36.5, color = "black")+
+  geom_hline(yintercept = 35.5, color = "black")
+
+#ggsave("figure_s12_sp_mod_cov.pdf", dpi = 1200, width = 7.24, height = 8.18, units = "in")
+
+```
+
+### Fig S5 - Sensitivity analysis with cyclical random walk for seasonality 
 ```{r}
 
 mod_sp_fig_rw1 <- obs ~ -1 + Intercept + binary_mozzies_rel_lag1 + log(mozzies_rel_plus1_lag1) + wmel_prev_lag1 + wmel_prev_lag2 + f(tot_aegypti_lag1_bin, model = "rw2") + f(tot_aegypti_lag2_bin, model = "rw2") + f(wk_avg_tmin_lag4_bin, model = "rw2") + f(imperv_bin, model = "rw2") + f(popdens_bin, model = "rw2") + f(elev_bin, model = "rw2") + f(income_bin, model = "rw2") + f(t_month, model = "rw1", cyclic = T) + f(t_week, model = "ar1") + offset(log_tot_aegypti) + f(spatial.field, model = spde)
@@ -1135,9 +1467,6 @@ result_sp_fig_rw1 <- inla(mod_sp_fig_rw1,
                 control.compute=list(config = TRUE, dic = TRUE, waic = TRUE),
                 verbose=T)#WAIC = 73364.16, DIC = 73325.56
 
-```
-
-```{r}
 ## time varyinig abundance
 mod_linear_rw1 <- result_sp_fig_rw1$summary.fixed
 
@@ -1539,7 +1868,7 @@ lm_rw1 <- lm(tot_wmel ~ fit, data = pred_data_rw1)
 
 ```
 
-#### AR1 + cyclic RW1
+#### Fig S6 - AR1 + cyclic RW1
 ```{r}
 mod_rw1_ar1_marginals <- result_sp_fig_rw1$marginals.random$t_week
 
@@ -1613,7 +1942,7 @@ ggsave("figure_rw1_rw1.jpg", dpi = 1200, width = 7, height = 7)
 ```
 
 
-#### Spatial Field 
+#### Fig S6 - Spatial Field 
 ```{r}
 release_areas <- read_sf("~/Documents/Yale EMD/Year 2/Rio Data Analysis/Data/simplified_release_areas_paloma.gpkg") |> 
   st_transform(crs = st_crs("+proj=utm +zone=23 +datum=WGS84 +units=m +no_defs"))
@@ -1664,8 +1993,7 @@ ggsave("figure_rw1_spatial_field.jpg", dpi = 1200)
 
 ```
 
-
-### Fig S5 - Sensativity Analysis: Monthly AR1
+### Fig S7 - Sensativity Analysis: Monthly AR1
 ```{r}
 mod_mnthly <- obs ~ -1 + Intercept + binary_mozzies_rel_lag1 + log(mozzies_rel_plus1_lag1) + wmel_prev_lag1 + wmel_prev_lag2 + f(tot_aegypti_lag1_bin, model = "rw2") + f(tot_aegypti_lag2_bin, model = "rw2") + wk_avg_precipmean_lag6 + wk_avg_precipmean_lag8 + f(wk_avg_tmin_lag1_bin, model = "rw2") + f(wk_avg_tmin_lag2_bin, model = "rw2") + f(wk_avg_tmin_lag4_bin, model = "rw2") + f(wk_avg_tmin_lag5_bin, model = "rw2") + f(imperv_bin, model = "rw2") + f(popdens_bin, model = "rw2") + f(elev_bin, model = "rw2") + f(hhincome_bin, model = "rw2") + f(t_month, model = "ar1") + offset(log_tot_aegypti) + f(spatial.field, model = spde)
 
@@ -2212,12 +2540,12 @@ ggplot(aes(x = effect, y = rev(new.order))) +
   geom_hline(yintercept = 35.5, color = "black", alpha = 0.3)+
   geom_hline(yintercept = 30.5, color = "black", alpha = 0.3)
 
-ggsave("figure_sp_month_ar1_cov_s5.pdf", dpi = 1200, width = 7.24, height = 11, units = "in")
+#ggsave("figure_sp_month_ar1_cov_s5.pdf", dpi = 1200, width = 7.24, height = 11, units = "in")
 
 ```
 
 
-### Fig S6 - Sensativity Analysis: Yearly AR1
+### Fig S8 - Sensativity Analysis: Yearly AR1
 ```{r}
 mod_yrly <- obs ~ -1 + Intercept + binary_mozzies_rel_lag1 + log(mozzies_rel_plus1_lag1) + wmel_prev_lag1 + wmel_prev_lag2 + f(tot_aegypti_lag1_bin, model = "rw2") + f(tot_aegypti_lag2_bin, model = "rw2") + wk_avg_precipmean_lag2 + wk_avg_precipmean_lag5 + wk_avg_precipmean_lag6 + wk_avg_precipmean_lag7 + wk_avg_precipmean_lag8 + f(wk_avg_tmin_lag1_bin, model = "rw2") + f(wk_avg_tmin_lag2_bin, model = "rw2") + f(wk_avg_tmin_lag3_bin, model = "rw2") + f(wk_avg_tmin_lag4_bin, model = "rw2") + f(wk_avg_tmin_lag5_bin, model = "rw2") + f(imperv_bin, model = "rw2") + f(popdens_bin, model = "rw2") + f(elev_bin, model = "rw2") + f(hhincome_bin, model = "rw2") + f(t_year, model = "ar1") + offset(log_tot_aegypti) + f(spatial.field, model = spde)
 
@@ -2851,7 +3179,7 @@ ggplot(aes(x = effect, y = rev(new.order))) +
 
 ```
 
-### Fig S7 - Sensativity Analysis: 50m trap radius 
+### Fig S9 - Sensativity Analysis: 50m trap radius 
 ```{r - 50m radius}
 ## Set up mesh and stack
 ### Set up Mesh
@@ -3250,7 +3578,7 @@ ggplot() +
 
 ```
 
-### Fig S8 - Sensativity Analysis: 200m trap radius
+### Fig S10 - Sensativity Analysis: 200m trap radius
 ```{r - 200m radius}
 ## Set up mesh and stack
 spatial.range <- 22000
@@ -3648,7 +3976,7 @@ ggplot() +
 
 ```
 
-### Fig S9 - Sensativity Analysis: Vehicle Releases Only 
+### Fig S11 - Sensativity Analysis: Vehicle Releases Only 
 ```{r - Vehicle releases}
 ## Set up mesh and stack
 spatial.range <- 22000
@@ -4047,7 +4375,7 @@ ggplot() +
 
 ```
 
-### Fig S10 - Sensativity Analysis: Random Sample of Space-Time Observations
+### Fig S12 - Sensativity Analysis: Random Sample of Space-Time Observations
 ```{r - subsample of observations}
 ## DF set-up
 ### Set the seed for reproducibility 
@@ -4460,7 +4788,7 @@ ggplot() +
 
 ```
 
-### Fig S11 - Sensativity Analysis: Non-Release Time Periods
+### Fig S13 - Sensativity Analysis: Non-Release Time Periods
 ```{r - subsample of observations}
 ## DF set-up
 ### Set the seed for reproducibility 
@@ -4863,283 +5191,162 @@ ggplot() +
   geom_hline(yintercept = 38.5, color = "black", alpha = 0.6)+
   geom_hline(yintercept = 37.5, color = "black")
 
-ggsave("figure_nr2_cov_s11.pdf", dpi = 1200, width = 7.24, height = 8.18, units = "in")
+#ggsave("figure_nr2_cov_s11.pdf", dpi = 1200, width = 7.24, height = 8.18, units = "in")
 
 ```
 
-### Fig S12 - Sensativity Analysis: Model without Ae. aegypti trap counts 
+### Fig S14 - Sensitivity analysis: scaled figures 
 ```{r}
-mod_fig_s12 <- obs ~ -1 + Intercept + binary_mozzies_rel_lag1 + log(mozzies_rel_plus1_lag1) + wk_avg_precipmean_lag6 + f(wk_avg_tmin_lag4_bin, model = "rw2") + f(imperv_bin, model = "rw2") + f(popdens_bin, model = "rw2") + f(elev_bin, model = "rw2") + f(income_bin, model = "rw2") + f(t_week, model = "ar1") + offset(log_tot_aegypti) + f(spatial.field, model = spde)
+## scale variables
+sd_scale <- function(x) x / sd(x, na.rm = TRUE)
 
-result_fig_s12 <- inla(mod_fig_s12,
-                data=inla.stack.data(stack),
+sp_temp_full_df_s13 <- sp_temp_full_df_4 %>%
+  mutate(log_mozzies_rel_plus1_lag1_sd = sd_scale(log(mozzies_rel_plus1_lag1)),
+         wmel_prev_lag1_sd = sd_scale(wmel_prev_lag1),
+         wmel_prev_lag2_sd = sd_scale(wmel_prev_lag2))
+
+### SDs on the original scale for the plot labels
+s13_sd <- c(log_mozzies_rel_plus1_lag1 = sd(log(sp_temp_full_df_4$mozzies_rel_plus1_lag1), na.rm = TRUE),
+            wmel_prev_lag1 = sd(sp_temp_full_df_4$wmel_prev_lag1, na.rm = TRUE),
+            wmel_prev_lag2 = sd(sp_temp_full_df_4$wmel_prev_lag2, na.rm = TRUE))
+
+## update stack
+stack_s13 = inla.stack(data=list(obs=sp_temp_full_df_s13$tot_wmel),
+                       A=list(A.est, 1),
+                       effects=list(spatial_field = data.frame(s.index, Intercept=1),
+                                    dplyr::select(sp_temp_full_df_s13, -tot_wmel)), 
+                       tag='stdata')
+
+## Formula
+mod_fig_s13 <- obs ~ -1 + Intercept + binary_mozzies_rel_lag1 + log_mozzies_rel_plus1_lag1_sd + wmel_prev_lag1_sd + wmel_prev_lag2_sd + f(tot_aegypti_lag1_bin, model = "rw2") + f(tot_aegypti_lag2_bin, model = "rw2") + f(wk_avg_tmin_lag4_bin, model = "rw2") + f(imperv_bin, model = "rw2") + f(popdens_bin, model = "rw2") + f(elev_bin, model = "rw2") + f(income_bin, model = "rw2") + f(t_week, model = "ar1") + offset(log_tot_aegypti) + f(spatial.field, model = spde)
+
+## Model 
+result_fig_s13 <- inla(mod_fig_s13,
+                data=inla.stack.data(stack_s13),
                 family="nbinomial",
-                control.predictor=list(A=inla.stack.A(stack), compute = T), 
+                control.predictor=list(A=inla.stack.A(stack_s13), compute = T), 
                 control.fixed=list(expand.factor.strategy='inla'),
                 control.compute=list(config = TRUE, dic = TRUE, waic = TRUE),
                 verbose=T) 
 
-### binary mozzies_rel
-bin_mozzies_rel_marg_s12 <- result_fig_s12$marginals.fixed$binary_mozzies_rel_lag1
+#saveRDS(result_fig_s13, "data/result_fig_s13.rds")
 
-set.seed(123)
-beta_samples_1 <- inla.rmarginal(1000, bin_mozzies_rel_marg_s5)
-
-effect_samples_1 <- exp(beta_samples_1)
-
-bin_mozzies_rel_s12_df <- data.frame(
-  name = "binary_mozzies_rel_lag1",
-  ID = NA,
-  mean_effect  = mean(effect_samples_1),
-  lower_effect = quantile(effect_samples_1, 0.025),
-  upper_effect = quantile(effect_samples_1, 0.975))
-
-### "log_mozzies_rel_plus1_lag1"
-log_mozzies_rel_marg_s12 <- result_fig_s12$marginals.fixed$`log(mozzies_rel_plus1_lag1)`
-
-set.seed(123)
-beta_samples_2 <- inla.rmarginal(1000, log_mozzies_rel_marg_s5)
-
-effect_samples_2 <- exp(beta_samples_2)  
-
-log_mozzies_rel_s12_df <- data.frame(
-  name = "log_mozzies_rel_plus1_lag1",
-  ID = NA, 
-  mean_effect  = mean(effect_samples_2),
-  lower_effect = quantile(effect_samples_2, 0.025),
-  upper_effect = quantile(effect_samples_2, 0.975))
-
-### wmel_prev_lag1
-wk_avg_precipmean_lag6_marg_s12 <- result_fig_s12$marginals.fixed$wk_avg_precipmean_lag6
-
-set.seed(123)
-beta_samples_3 <- inla.rmarginal(1000, wk_avg_precipmean_lag6_marg_s5)
-
-effect_samples_3 <- exp(beta_samples_3*10)  
-
-wk_avg_precipmean_lag6_s12_df <- data.frame(
-  name = "wk_avg_precipmean_lag6",
-  ID = NA, 
-  mean_effect  = mean(effect_samples_3),
-  lower_effect = quantile(effect_samples_3, 0.025),
-  upper_effect = quantile(effect_samples_3, 0.975))
-
-
-### wk_avg_tmin_lag4_bin -- 15.9 18.5 22.3 20.6 24.0
-wk_avg_tmin_lag4_bin_marginals_s12 <- result_fig_s12$marginals.random$wk_avg_tmin_lag4_bin
-
-set.seed(123)
-wk_avg_tmin_lag4_bin_s12_df <- do.call(rbind, lapply(names(wk_avg_tmin_lag4_bin_marginals_s12), function(idx_name) {
-  
-  # Extract that bin’s marginal posterior
-  marg <- wk_avg_tmin_lag4_bin_marginals_s12[[idx_name]]
-  
-  # Sample from the posterior
+## Model plots
+### linear terms
+s13_fixed <- function(term, name) {
+  marg <- result_fig_s13$marginals.fixed[[term]]
+  set.seed(123)
   beta_samples <- inla.rmarginal(1000, marg)
-  
-  # Exponentiate to get multiplicative effect (since it’s usually on log-link)
   effect_samples <- exp(beta_samples)
-  
-  # Summarize posterior
   data.frame(
-    name = "wk_avg_tmin_lag4_bin",
-    ID = idx_name,
+    name = name,
+    ID = NA,
     mean_effect  = mean(effect_samples),
     lower_effect = quantile(effect_samples, 0.025),
-    upper_effect = quantile(effect_samples, 0.975))}))
+    upper_effect = quantile(effect_samples, 0.975))
+}
 
-### imperv_bin -- 72.42895 82.37428 90.84649 60.43978 37.56979
-imperv_bin_marginals_s12 <- result_fig_s12$marginals.random$imperv_bin 
+### rw2 terms
+s13_random <- function(term) {
+  marginals <- result_fig_s13$marginals.random[[term]]
+  set.seed(123)
+  do.call(rbind, lapply(names(marginals), function(idx_name) {
+    beta_samples <- inla.rmarginal(1000, marginals[[idx_name]])
+    effect_samples <- exp(beta_samples)
+    data.frame(
+      name = term,
+      ID = idx_name,
+      mean_effect  = mean(effect_samples),
+      lower_effect = quantile(effect_samples, 0.025),
+      upper_effect = quantile(effect_samples, 0.975))}))
+}
 
-set.seed(123)
-imperv_bin_s12_df <- do.call(rbind, lapply(names(imperv_bin_marginals_s12), function(idx_name) {
-  
-  # Extract that bin’s marginal posterior
-  marg <- imperv_bin_marginals_s12[[idx_name]]
-  
-  # Sample from the posterior
-  beta_samples <- inla.rmarginal(1000, marg)
-  
-  # Exponentiate to get multiplicative effect (since it’s usually on log-link)
-  effect_samples <- exp(beta_samples)
-  
-  # Summarize posterior
-  data.frame(
-    name = "imperv_bin",
-    ID = idx_name,
-    mean_effect  = mean(effect_samples),
-    lower_effect = quantile(effect_samples, 0.025),
-    upper_effect = quantile(effect_samples, 0.975))}))
+### same row order as mod_linear_nl_covariates
+mod_s13_covariates <- rbind(s13_fixed("binary_mozzies_rel_lag1", "binary_mozzies_rel_lag1"),
+                            s13_fixed("log_mozzies_rel_plus1_lag1_sd", "log_mozzies_rel_plus1_lag1"),
+                            s13_fixed("wmel_prev_lag1_sd", "wmel_prev_lag1"),
+                            s13_fixed("wmel_prev_lag2_sd", "wmel_prev_lag2"),
+                            s13_random("tot_aegypti_lag1_bin"),
+                            s13_random("tot_aegypti_lag2_bin"),
+                            s13_random("wk_avg_tmin_lag4_bin"),
+                            s13_random("popdens_bin"),
+                            s13_random("income_bin"),
+                            s13_random("imperv_bin"),
+                            s13_random("elev_bin"))
+stopifnot(nrow(mod_s13_covariates) == 39)
 
-### popdens_bin - 889.235657 508.161407 366.298981 162.876450 3.884808
-popdens_bin_marginals_s12 <- result_fig_s12$marginals.random$popdens_bin 
+## Bin medians in SD units 
+bin_sd_medians <- function(bin, x) {
+  z <- (x - mean(x, na.rm = TRUE)) / sd(x, na.rm = TRUE)
+  data.frame(bin = bin, z = z) %>%
+    filter(!is.na(bin)) %>%
+    group_by(bin) %>%
+    summarise(med_sd = median(z, na.rm = TRUE)) %>%
+    arrange(bin) %>%
+    pull(med_sd)
+}
 
-set.seed(123)
-popdens_bin_s12_df <- do.call(rbind, lapply(names(popdens_bin_marginals_s12), function(idx_name) {
-  
-  # Extract that bin’s marginal posterior
-  marg <- popdens_bin_marginals_s12[[idx_name]]
-  
-  # Sample from the posterior
-  beta_samples <- inla.rmarginal(1000, marg)
-  
-  # Exponentiate to get multiplicative effect (since it’s usually on log-link)
-  effect_samples <- exp(beta_samples)
-  
-  # Summarize posterior
-  data.frame(
-    name = "popdens_bin",
-    ID = idx_name,
-    mean_effect  = mean(effect_samples),
-    lower_effect = quantile(effect_samples, 0.025),
-    upper_effect = quantile(effect_samples, 0.975))}))
+### check that each bin column is paired with the continuous variable it was built from
+s13_dat <- as.data.frame(sp_temp_full_df_s13)
+s13_bin_meds <- c(bin_sd_medians(s13_dat$tot_aegypti_lag1_bin, exp(s13_dat$log_tot_aegypti_lag1)),
+                  bin_sd_medians(s13_dat$tot_aegypti_lag2_bin, exp(s13_dat$log_tot_aegypti_lag2)),
+                  bin_sd_medians(s13_dat$wk_avg_tmin_lag4_bin, s13_dat$wk_avg_tmin_lag4),
+                  bin_sd_medians(s13_dat$popdens_bin, s13_dat$pop_sum),
+                  bin_sd_medians(s13_dat$income_bin, s13_dat$mean_income),
+                  bin_sd_medians(s13_dat$imperv_bin, s13_dat$imperv_perc),
+                  bin_sd_medians(s13_dat$elev_bin, s13_dat$elev))
+stopifnot(length(s13_bin_meds) == 35)
 
-### elev_bin - 41.341003 21.842211 13.229877  6.084577  8.856280
-elev_bin_marginals_s12 <- result_fig_s12$marginals.random$elev_bin 
+## Labels
+mod_s13_covariates$new_cov_names <- mod_linear_nl_covariates$new_cov_names
 
-set.seed(123)
-elev_bin_s12_df <- do.call(rbind, lapply(names(elev_bin_marginals_s12), function(idx_name) {
-  
-  # Extract that bin’s marginal posterior
-  marg <- elev_bin_marginals_s12[[idx_name]]
-  
-  # Sample from the posterior
-  beta_samples <- inla.rmarginal(1000, marg)
-  
-  # Exponentiate to get multiplicative effect (since it’s usually on log-link)
-  effect_samples <- exp(beta_samples)
-  
-  # Summarize posterior
-  data.frame(
-    name = "elev_bin",
-    ID = idx_name,
-    mean_effect  = mean(effect_samples),
-    lower_effect = quantile(effect_samples, 0.025),
-    upper_effect = quantile(effect_samples, 0.975))}))
+mod_s13_covariates_2 <- mod_s13_covariates %>%
+  mutate(order = 1:39,
+         bin = c("y/n",
+                 paste0("1 SD = ", signif(s13_sd["log_mozzies_rel_plus1_lag1"], 2), " log1p"),
+                 paste0("1 SD = ", signif(s13_sd["wmel_prev_lag1"], 2)),
+                 paste0("1 SD = ", signif(s13_sd["wmel_prev_lag2"], 2)),
+                 sprintf("%.2f", s13_bin_meds)),
+         order.new = if_else(order >= 5, order + 1, order))
 
-### income_bin - 965.4459  483.3841 1349.1109  738.3354 2362.8327
-income_bin_marginals_s12 <- result_fig_s12$marginals.random$income_bin 
+cols <- colnames(mod_s13_covariates_2)
 
-set.seed(123)
-income_bin_s12_df <- do.call(rbind, lapply(names(income_bin_marginals_s12), function(idx_name) {
-  
-  # Extract that bin’s marginal posterior
-  marg <- income_bin_marginals_s12[[idx_name]]
-  
-  # Sample from the posterior
-  beta_samples <- inla.rmarginal(1000, marg)
-  
-  # Exponentiate to get multiplicative effect (since it’s usually on log-link)
-  effect_samples <- exp(beta_samples)
-  
-  # Summarize posterior
-  data.frame(
-    name = "income_bin",
-    ID = idx_name,
-    mean_effect  = mean(effect_samples),
-    lower_effect = quantile(effect_samples, 0.025),
-    upper_effect = quantile(effect_samples, 0.975))}))
+new_row <- data.frame(matrix(ncol = length(cols), nrow = 1))
+colnames(new_row) <- cols
 
+mod_s13_covariates_3 <- rbind(mod_s13_covariates_2, new_row)
 
+mod_s13_covariates_3[40,]$order.new <- 5
+mod_s13_covariates_3[40,]$new_cov_names <- ""
+mod_s13_covariates_3[40,]$bin <- "Median (SD)"
 
+mod_s13_covariates_3 <- mod_s13_covariates_3 %>%
+  arrange(order.new)
 
-# bin_mozzies_rel_s12_df, log_mozzies_rel_s12_df, wk_avg_precipmean_lag6_s12_df,
-#wk_avg_tmin_lag4_bin_s12_df, imperv_bin_s12_df, popdens_bin_s12_df, elev_bin_s12_df,  
-# income_bin_s12_df
-
-mod_s12_linear_nl_covariates <- rbind(bin_mozzies_rel_s12_df,
-                                   log_mozzies_rel_s12_df,
-                                  wk_avg_precipmean_lag6_s12_df, 
-                                   wk_avg_tmin_lag4_bin_s12_df,
-                                  popdens_bin_s12_df,
-                                  income_bin_s12_df,
-                                   imperv_bin_s12_df,
-                                   elev_bin_s12_df)
-
-
-new_cov_names_s12 <- c("wMel released lag 1w", 
-                   "No. wMel released lag 1w*", 
-                   "Daily precipitation lag 6w",
-                   "Weekly temperature lag 4w",
-                   "", 
-                   "",
-                   "",
-                   "",
-                   "Inhabitants",
-                   "",
-                   "",
-                   "",
-                   "",
-                   "Income", 
-                   "",
-                   "",
-                   "",
-                   "",
-                   "Impervious surface",
-                   "",
-                   "",
-                   "",
-                   "",
-                   "Elevation", 
-                   "",
-                   "",
-                   "",
-                   "")
-
-mod_s12_linear_nl_covariates$new_cov_names <- new_cov_names_s12
-
-order <- c(1:28)
-
-mod_s12_linear_nl_covariates$order <- order
-
-mod_s12_linear_nl_covariates_2 <- mod_s12_linear_nl_covariates %>%
-  mutate(new.order = if_else(order == 3, 5, order), 
-         new.order = if_else(order >= 4, order + 13, new.order)) %>%
-  dplyr::select(!(order)) %>%
-  dplyr::select(!(new_cov_names))
-
-mod_s12_linear_nl_covariates_2[29,]$new.order <- 3
-mod_s12_linear_nl_covariates_2[30,]$new.order <- 4
-mod_s12_linear_nl_covariates_2[31,]$new.order <- 6
-mod_s12_linear_nl_covariates_2[32,]$new.order <- 7
-mod_s12_linear_nl_covariates_2[33,]$new.order <- 8
-mod_s12_linear_nl_covariates_2[34,]$new.order <- 9
-mod_s12_linear_nl_covariates_2[35,]$new.order <- 10
-mod_s12_linear_nl_covariates_2[36,]$new.order <- 11
-mod_s12_linear_nl_covariates_2[37,]$new.order <- 12
-mod_s12_linear_nl_covariates_2[38,]$new.order <- 13
-mod_s12_linear_nl_covariates_2[39,]$new.order <- 14
-mod_s12_linear_nl_covariates_2[40,]$new.order <- 15
-mod_s12_linear_nl_covariates_2[41,]$new.order <- 16
-
+## Joint plot with main model
 main_mod_covs <- mod_linear_nl_covariates_4 %>%
-  dplyr::select(new_cov_names, order.new, mean_effect, lower_effect, upper_effect, bin) %>%
+  dplyr::select(order.new, mean_effect, lower_effect, upper_effect) %>%
   rename(old_mod_effect = mean_effect) %>%
   rename(old_mod_lw = lower_effect) %>%
-  rename(old_mod_up = upper_effect) %>%
-  mutate(new.order = if_else(order.new >= 5, order.new + 1, order.new)) %>%
-  dplyr::select(!(order.new))
+  rename(old_mod_up = upper_effect) 
 
-main_mod_covs[41,]$new.order <- 5
-main_mod_covs[41,]$new_cov_names <- "Daily precipitation lag 6w"
-main_mod_covs[41,]$bin <- "cm"
+mod_s13_combined <- left_join(mod_s13_covariates_3, main_mod_covs, 
+                              by = c("order.new" = "order.new"))
 
-mod_sp_comb <- left_join(main_mod_covs, mod_s12_linear_nl_covariates_2, 
-                         by = c("new.order" = "new.order")) 
+### sanity check: rw2 rows should match the main model (differences ~0)
+mod_s13_combined %>%
+  filter(order.new >= 6) %>%
+  summarise(max_diff = max(abs(mean_effect - old_mod_effect), na.rm = TRUE))
 
-mod_sp_comb_2 <- mod_sp_comb %>%
-  arrange(new.order)
-
-## Forest Plot
-mod_sp_comb_2 %>%
-ggplot(aes(y = rev(new.order))) +
-  geom_errorbarh(aes(x = old_mod_effect, xmin = old_mod_lw, xmax = old_mod_up),  height = 0.2, 
-                 color = "black", size = 1, alpha = 0.7) + 
-  geom_point(aes(x = old_mod_effect), size = 2, shape = 15, color = "black", alpha = 0.7) +
-  geom_errorbarh(aes(x = mean_effect, xmin = lower_effect, xmax = upper_effect), height = 0.2, 
+mod_s13_combined %>%
+ggplot() +
+  geom_errorbarh(aes(y = rev(order.new), xmin = old_mod_lw, xmax = old_mod_up), 
+                 height = 0.2, color = "black", size = 1, alpha = 0.7) +
+  geom_point(aes(x = old_mod_effect, y = rev(order.new)), size = 2, shape = 15, color = "black", alpha = 0.7) +
+  geom_errorbarh(aes(y = rev(order.new), xmin = lower_effect, xmax = upper_effect), height = 0.2, 
                  color = "steelblue", size = 1, alpha = 0.8) +
-  geom_point(aes(x = mean_effect), size = 2, shape = 15, color = "steelblue") +
-  geom_vline(xintercept=1, lty=2, color = "red", size = 1) +
+  geom_point(aes(x =  mean_effect, y = rev(order.new)), size = 2, shape = 15, color = "steelblue") +
+  geom_vline(xintercept=1, lty=2, color = "red") +
   theme_classic() +
   xlab("Effect Estimate (95% CI)") +
   ylab("") +
@@ -5150,29 +5357,29 @@ ggplot(aes(y = rev(new.order))) +
         axis.title.y = element_text(size = 18),
         axis.title.x = element_text(size = 11),
         plot.margin = margin(t = 10, r = 10, b = 10, l = 20), 
-        text = element_text(family = "Helvetica")) +  
+        text = element_text(family = "Helvetica")) +   
   scale_y_discrete(labels = function(y) str_wrap(y, width = 500))+
   scale_x_continuous(breaks = seq(0.5, 1.75, by = 0.25))+
-  geom_text(aes(x = 0.4, label = new_cov_names, fontface = "bold"), hjust = 1, size = 3.5)+
-  geom_text(aes(x = 2, label = bin), hjust = 0, size = 3.5)+
-  coord_cartesian(xlim = c(-0.35, 2.3))+
-  geom_hline(yintercept = seq(2.5, 40.5, by = 1), color = "lightgrey", alpha = 0.7)+
+  geom_text(aes(x = 0.4, y = rev(order.new), label = new_cov_names, fontface = "bold"), hjust = 1, size = 3.5)+
+  geom_text(aes(x = 2, y = rev(order.new), label = bin), hjust = 0, size = 3.5)+
+  coord_cartesian(xlim = c(-0.4, 2.6))+
+  geom_hline(yintercept = seq(2.5, 39.5, by = 1), color = "lightgrey", alpha = 0.7)+
   geom_hline(yintercept = 5.5, color = "black", alpha = 0.6)+
   geom_hline(yintercept = 10.5, color = "black", alpha = 0.6)+
   geom_hline(yintercept = 15.5, color = "black", alpha = 0.6)+
   geom_hline(yintercept = 20.5, color = "black", alpha = 0.6)+
   geom_hline(yintercept = 25.5, color = "black", alpha = 0.6)+
   geom_hline(yintercept = 30.5, color = "black", alpha = 0.6)+
-  geom_hline(yintercept = 40.5, color = "black", alpha = 0.6)+
+  geom_hline(yintercept = 38.5, color = "black", alpha = 0.6)+
   geom_hline(yintercept = 39.5, color = "black", alpha = 0.6)+
-  geom_hline(yintercept = 37.5, color = "black", alpha = 0.6)+
-  #geom_hline(yintercept = 41.5, color = "black", alpha = 0.6)+
-  geom_hline(yintercept = 36.5, color = "black")+
+  geom_hline(yintercept = 36.5, color = "black", alpha = 0.6)+
   geom_hline(yintercept = 35.5, color = "black")
 
-#ggsave("figure_s12_sp_mod_cov.pdf", dpi = 1200, width = 7.24, height = 8.18, units = "in")
+#ggsave("figure_s14_scaled_cov.pdf", dpi = 1200, width = 7.24, height = 8.18, units = "in")
+#ggsave("figure_s14_scaled_cov.png", dpi = 1200, width = 7.24, height = 8.18, units = "in")
 
 ```
+
 
 ### Calculate Main Model R^2
 ```{r}
