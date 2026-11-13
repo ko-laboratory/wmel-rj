@@ -981,7 +981,7 @@ CCCCDDDDEEEEFFFF"
   guides(color = guide_legend(override.aes = list(size = 6))) &
   theme(plot.tag.position = c(0.04, 1)))
 
-# ggsave(plot = fig2, "outputs/fig2_sep19.pdf", width = 18, height = 10)
+ggsave(plot = fig2, "outputs/2026-11-12_fig2.pdf", width = 18, height = 10)
 # ggsave(plot = fig2, "outputs/fig2_sep19.png", width = 18, height = 10)
 ```
 
@@ -1464,7 +1464,7 @@ phi_sensitivity_plot <- phi_long |>
 phi_sensitivity_plot
 
 # ggsave("outputs/figureS14_phi_sensitivity.pdf", plot = phi_sensitivity_plot, width = 10, height = 5)
-ggsave("outputs/figures14_phi_sensitivity.png", plot = phi_sensitivity_plot, width = 10, height = 5)
+# ggsave("outputs/figures14_phi_sensitivity.png", plot = phi_sensitivity_plot, width = 10, height = 5)
 ```
 
 ### Figure S20: ROC curve
@@ -1485,6 +1485,9 @@ roc_db <- ff_by_quantile |>
   geom_abline(slope = 1, intercept = 0, lty = 2) +
   labs(title = "ROC for wMel released/FF to predict 20% introgression", x = "1 - Specificity", y = "Sensitivity") +
   theme_bw())
+
+ggsave("outputs/Figure_S16.eps", width = 6, height = 6)
+ggsave("outputs/Figure_S16.tif", width = 6, height = 6)
 
 auc_value20 <- calc_auc(roc_plot20)$AUC
 ```
